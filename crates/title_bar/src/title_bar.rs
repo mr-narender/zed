@@ -664,6 +664,7 @@ impl TitleBar {
                         client
                             .authenticate_and_connect(true, &cx)
                             .await
+                            .into_response()
                             .notify_async_err(cx);
                     })
                     .detach();
@@ -678,7 +679,7 @@ impl TitleBar {
                 .anchor(Corner::TopRight)
                 .menu(move |window, cx| {
                     ContextMenu::build(window, cx, |menu, _, _cx| {
-                        menu.action(
+                        menu.link(
                             format!(
                                 "Current Plan: {}",
                                 match plan {
