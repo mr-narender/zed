@@ -35,6 +35,7 @@ actions!(
         Quit,
         OpenKeymap,
         About,
+        OpenDocs,
         OpenLicenses,
         OpenTelemetryLog,
     ]
@@ -139,6 +140,12 @@ pub mod git {
 
     actions!(git, [CheckoutBranch, Switch, SelectRepo]);
     action_with_deprecated_aliases!(git, Branch, ["branches::OpenRecent"]);
+}
+
+pub mod jj {
+    use gpui::actions;
+
+    actions!(jj, [BookmarkList]);
 }
 
 pub mod command_palette {
