@@ -17,7 +17,7 @@ use crate::{
     task_context::RunnableRange,
     text_diff::text_diff,
 };
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Context as _, Result};
 use async_watch as watch;
 pub use clock::ReplicaId;
 use clock::{AGENT_REPLICA_ID, Lamport};
@@ -492,7 +492,7 @@ pub struct Diff {
     pub edits: Vec<(Range<usize>, Arc<str>)>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct DiagnosticEndpoint {
     offset: usize,
     is_start: bool,
@@ -816,13 +816,11 @@ impl Buffer {
         message: proto::BufferState,
         file: Option<Arc<dyn File>>,
     ) -> Result<Self> {
-        let buffer_id = BufferId::new(message.id)
-            .with_context(|| anyhow!("Could not deserialize buffer_id"))?;
+        let buffer_id = BufferId::new(message.id).context("Could not deserialize buffer_id")?;
         let buffer = TextBuffer::new(replica_id, buffer_id, message.base_text);
         let mut this = Self::build(buffer, file, capability);
         this.text.set_line_ending(proto::deserialize_line_ending(
-            rpc::proto::LineEnding::from_i32(message.line_ending)
-                .ok_or_else(|| anyhow!("missing line_ending"))?,
+            rpc::proto::LineEnding::from_i32(message.line_ending).context("missing line_ending")?,
         ));
         this.saved_version = proto::deserialize_version(&message.saved_version);
         this.saved_mtime = message.saved_mtime.map(|time| time.into());
@@ -2698,7 +2696,7 @@ impl Buffer {
         }
         self.send_operation(
             Operation::UpdateCompletionTriggers {
-                triggers: triggers.iter().cloned().collect(),
+                triggers: triggers.into_iter().collect(),
                 lamport_timestamp: self.completion_triggers_timestamp,
                 server_id,
             },
@@ -2857,6 +2855,7 @@ impl BufferSnapshot {
     ) -> Option<impl Iterator<Item = Option<IndentSuggestion>> + '_> {
         let config = &self.language.as_ref()?.config;
         let prev_non_blank_row = self.prev_non_blank_row(row_range.start);
+        let significant_indentation = config.significant_indentation;
 
         // Find the suggested indentation ranges based on the syntax tree.
         let start = Point::new(prev_non_blank_row.unwrap_or(row_range.start), 0);
@@ -2876,6 +2875,7 @@ impl BufferSnapshot {
         while let Some(mat) = matches.peek() {
             let mut start: Option<Point> = None;
             let mut end: Option<Point> = None;
+            let mut outdent: Option<Point> = None;
 
             let config = &indent_configs[mat.grammar_index];
             for capture in mat.captures {
@@ -2887,16 +2887,23 @@ impl BufferSnapshot {
                 } else if Some(capture.index) == config.end_capture_ix {
                     end = Some(Point::from_ts_point(capture.node.start_position()));
                 } else if Some(capture.index) == config.outdent_capture_ix {
-                    outdent_positions.push(Point::from_ts_point(capture.node.start_position()));
+                    let point = Point::from_ts_point(capture.node.start_position());
+                    outdent.get_or_insert(point);
+                    outdent_positions.push(point);
                 }
             }
 
             matches.advance();
+            // in case of significant indentation expand end to outdent position
+            let end = if significant_indentation {
+                outdent.or(end)
+            } else {
+                end
+            };
             if let Some((start, end)) = start.zip(end) {
-                if start.row == end.row {
+                if start.row == end.row && (!significant_indentation || start.column < end.column) {
                     continue;
                 }
-
                 let range = start..end;
                 match indent_ranges.binary_search_by_key(&range.start, |r| r.start) {
                     Err(ix) => indent_ranges.insert(ix, range),
@@ -2932,16 +2939,20 @@ impl BufferSnapshot {
             matches.advance();
         }
 
-        outdent_positions.sort();
-        for outdent_position in outdent_positions {
-            // find the innermost indent range containing this outdent_position
-            // set its end to the outdent position
-            if let Some(range_to_truncate) = indent_ranges
-                .iter_mut()
-                .filter(|indent_range| indent_range.contains(&outdent_position))
-                .next_back()
-            {
-                range_to_truncate.end = outdent_position;
+        // we don't use outdent positions to truncate in case of significant indentation
+        // rather we use them to expand (handled above)
+        if !significant_indentation {
+            outdent_positions.sort();
+            for outdent_position in outdent_positions {
+                // find the innermost indent range containing this outdent_position
+                // set its end to the outdent position
+                if let Some(range_to_truncate) = indent_ranges
+                    .iter_mut()
+                    .filter(|indent_range| indent_range.contains(&outdent_position))
+                    .next_back()
+                {
+                    range_to_truncate.end = outdent_position;
+                }
             }
         }
 
@@ -3011,8 +3022,14 @@ impl BufferSnapshot {
                 if range.start.row == prev_row && range.end > row_start {
                     indent_from_prev_row = true;
                 }
-                if range.end > prev_row_start && range.end <= row_start {
-                    outdent_to_row = outdent_to_row.min(range.start.row);
+                if significant_indentation && self.is_line_blank(row) && range.start.row == prev_row
+                {
+                    indent_from_prev_row = true;
+                }
+                if !significant_indentation || !self.is_line_blank(row) {
+                    if range.end > prev_row_start && range.end <= row_start {
+                        outdent_to_row = outdent_to_row.min(range.start.row);
+                    }
                 }
             }
 
@@ -4575,7 +4592,7 @@ impl<'a> Iterator for BufferChunks<'a> {
                 syntax_highlight_id: highlight_id,
                 diagnostic_severity: self.current_diagnostic_severity(),
                 is_unnecessary: self.current_code_is_unnecessary(),
-                ..Default::default()
+                ..Chunk::default()
             })
         } else {
             None
