@@ -2,18 +2,22 @@ mod persistence;
 pub mod terminal_element;
 pub mod terminal_panel;
 pub mod terminal_scrollbar;
+mod terminal_slash_command;
 pub mod terminal_tab_tooltip;
 
+use assistant_slash_command::SlashCommandRegistry;
 use editor::{Editor, EditorSettings, actions::SelectAll, scroll::ScrollbarAutoHide};
 use gpui::{
     AnyElement, App, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, KeyContext,
     KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, Pixels, Render, ScrollWheelEvent,
-    Stateful, Styled, Subscription, Task, WeakEntity, anchored, deferred, div, impl_actions,
+    Stateful, Styled, Subscription, Task, WeakEntity, actions, anchored, deferred, div,
+    impl_actions,
 };
 use itertools::Itertools;
 use persistence::TERMINAL_DB;
 use project::{Entry, Metadata, Project, search::SearchQuery, terminals::TerminalKind};
 use schemars::JsonSchema;
+use task::TaskId;
 use terminal::{
     Clear, Copy, Event, HoveredWord, MaybeNavigationTarget, Paste, ScrollLineDown, ScrollLineUp,
     ScrollPageDown, ScrollPageUp, ScrollToBottom, ScrollToTop, ShowCharacterPalette, TaskState,
@@ -27,6 +31,7 @@ use terminal::{
 use terminal_element::{TerminalElement, is_blank};
 use terminal_panel::TerminalPanel;
 use terminal_scrollbar::TerminalScrollHandle;
+use terminal_slash_command::TerminalSlashCommand;
 use terminal_tab_tooltip::TerminalTooltip;
 use ui::{
     ContextMenu, Icon, IconName, Label, Scrollbar, ScrollbarState, Tooltip, h_flex, prelude::*,
@@ -50,7 +55,7 @@ use zed_actions::assistant::InlineAssist;
 
 use std::{
     cmp,
-    ops::RangeInclusive,
+    ops::{Range, RangeInclusive},
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
@@ -71,9 +76,12 @@ pub struct SendText(String);
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq)]
 pub struct SendKeystroke(String);
 
+actions!(terminal, [RerunTask]);
+
 impl_actions!(terminal, [SendText, SendKeystroke]);
 
 pub fn init(cx: &mut App) {
+    assistant_slash_command::init(cx);
     terminal_panel::init(cx);
     terminal::init(cx);
 
@@ -83,6 +91,7 @@ pub fn init(cx: &mut App) {
         workspace.register_action(TerminalView::deploy);
     })
     .detach();
+    SlashCommandRegistry::global(cx).register_command(TerminalSlashCommand, true);
 }
 
 pub struct BlockProperties {
@@ -107,7 +116,7 @@ pub struct TerminalView {
     context_menu: Option<(Entity<ContextMenu>, gpui::Point<Pixels>, Subscription)>,
     cursor_shape: CursorShape,
     blink_state: bool,
-    embedded: bool,
+    mode: TerminalMode,
     blinking_terminal_enabled: bool,
     cwd_serialized: bool,
     blinking_paused: bool,
@@ -122,8 +131,19 @@ pub struct TerminalView {
     scroll_handle: TerminalScrollHandle,
     show_scrollbar: bool,
     hide_scrollbar_task: Option<Task<()>>,
+    marked_text: Option<String>,
+    marked_range_utf16: Option<Range<usize>>,
     _subscriptions: Vec<Subscription>,
     _terminal_subscriptions: Vec<Subscription>,
+}
+
+#[derive(Default, Clone)]
+pub enum TerminalMode {
+    #[default]
+    Scrollable,
+    Embedded {
+        max_lines: Option<usize>,
+    },
 }
 
 #[derive(Debug)]
@@ -165,7 +185,6 @@ impl TerminalView {
         workspace: WeakEntity<Workspace>,
         workspace_id: Option<WorkspaceId>,
         project: WeakEntity<Project>,
-        embedded: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -204,7 +223,7 @@ impl TerminalView {
             blink_epoch: 0,
             hover: None,
             hover_tooltip_update: Task::ready(()),
-            embedded,
+            mode: TerminalMode::Scrollable,
             workspace_id,
             show_breadcrumbs: TerminalSettings::get_global(cx).toolbar.breadcrumbs,
             block_below_cursor: None,
@@ -214,6 +233,8 @@ impl TerminalView {
             show_scrollbar: !Self::should_autohide_scrollbar(cx),
             hide_scrollbar_task: None,
             cwd_serialized: false,
+            marked_text: None,
+            marked_range_utf16: None,
             _subscriptions: vec![
                 focus_in,
                 focus_out,
@@ -221,6 +242,60 @@ impl TerminalView {
             ],
             _terminal_subscriptions: terminal_subscriptions,
         }
+    }
+
+    /// Enable 'embedded' mode where the terminal displays the full content with an optional limit of lines.
+    pub fn set_embedded_mode(&mut self, max_lines: Option<usize>, cx: &mut Context<Self>) {
+        self.mode = TerminalMode::Embedded { max_lines };
+        cx.notify();
+    }
+
+    pub fn is_content_limited(&self, window: &Window) -> bool {
+        match &self.mode {
+            TerminalMode::Scrollable => false,
+            TerminalMode::Embedded { max_lines } => {
+                !self.focus_handle.is_focused(window) && max_lines.is_some()
+            }
+        }
+    }
+
+    /// Sets the marked (pre-edit) text from the IME.
+    pub(crate) fn set_marked_text(
+        &mut self,
+        text: String,
+        range: Range<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        self.marked_text = Some(text);
+        self.marked_range_utf16 = Some(range);
+        cx.notify();
+    }
+
+    /// Gets the current marked range (UTF-16).
+    pub(crate) fn marked_text_range(&self) -> Option<Range<usize>> {
+        self.marked_range_utf16.clone()
+    }
+
+    /// Clears the marked (pre-edit) text state.
+    pub(crate) fn clear_marked_text(&mut self, cx: &mut Context<Self>) {
+        if self.marked_text.is_some() {
+            self.marked_text = None;
+            self.marked_range_utf16 = None;
+            cx.notify();
+        }
+    }
+
+    /// Commits (sends) the given text to the PTY. Called by InputHandler::replace_text_in_range.
+    pub(crate) fn commit_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        if !text.is_empty() {
+            self.terminal.update(cx, |term, _| {
+                term.input(text.to_string().into_bytes());
+            });
+        }
+    }
+
+    pub(crate) fn terminal_bounds(&self, cx: &App) -> TerminalBounds {
+        self.terminal.read(cx).last_content().terminal_bounds
     }
 
     pub fn entity(&self) -> &Entity<Terminal> {
@@ -332,6 +407,16 @@ impl TerminalView {
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
         self.terminal.update(cx, |term, _| term.select_all());
         cx.notify();
+    }
+
+    fn rerun_task(&mut self, _: &RerunTask, window: &mut Window, cx: &mut Context<Self>) {
+        let task = self
+            .terminal
+            .read(cx)
+            .task()
+            .map(|task| terminal_rerun_override(&task.id))
+            .unwrap_or_default();
+        window.dispatch_action(Box::new(task), cx);
     }
 
     fn clear(&mut self, _: &Clear, _: &mut Window, cx: &mut Context<Self>) {
@@ -581,7 +666,7 @@ impl TerminalView {
     fn send_text(&mut self, text: &SendText, _: &mut Window, cx: &mut Context<Self>) {
         self.clear_bell(cx);
         self.terminal.update(cx, |term, _| {
-            term.input(text.0.to_string());
+            term.input(text.0.to_string().into_bytes());
         });
     }
 
@@ -589,7 +674,12 @@ impl TerminalView {
         if let Some(keystroke) = Keystroke::parse(&text.0).log_err() {
             self.clear_bell(cx);
             self.terminal.update(cx, |term, cx| {
-                term.try_keystroke(&keystroke, TerminalSettings::get_global(cx).option_as_meta);
+                let processed =
+                    term.try_keystroke(&keystroke, TerminalSettings::get_global(cx).option_as_meta);
+                if processed && term.vi_mode_enabled() {
+                    cx.notify();
+                }
+                processed
             });
         }
     }
@@ -753,6 +843,7 @@ impl TerminalView {
     fn render_scrollbar(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
         if !Self::should_show_scrollbar(cx)
             || !(self.show_scrollbar || self.scrollbar_state.is_dragging())
+            || matches!(self.mode, TerminalMode::Embedded { .. })
         {
             return None;
         }
@@ -826,19 +917,22 @@ impl TerminalView {
                 .size(ButtonSize::Compact)
                 .icon_color(Color::Default)
                 .shape(ui::IconButtonShape::Square)
-                .tooltip(Tooltip::text("Rerun task"))
+                .tooltip(move |window, cx| {
+                    Tooltip::for_action("Rerun task", &RerunTask, window, cx)
+                })
                 .on_click(move |_, window, cx| {
-                    window.dispatch_action(
-                        Box::new(zed_actions::Rerun {
-                            task_id: Some(task_id.0.clone()),
-                            allow_concurrent_runs: Some(true),
-                            use_new_terminal: Some(false),
-                            reevaluate_context: false,
-                        }),
-                        cx,
-                    );
+                    window.dispatch_action(Box::new(terminal_rerun_override(&task_id)), cx);
                 }),
         )
+    }
+}
+
+fn terminal_rerun_override(task: &TaskId) -> zed_actions::Rerun {
+    zed_actions::Rerun {
+        task_id: Some(task.0.clone()),
+        allow_concurrent_runs: Some(true),
+        use_new_terminal: Some(false),
+        reevaluate_context: false,
     }
 }
 
@@ -1360,6 +1454,7 @@ impl Render for TerminalView {
             .on_action(cx.listener(TerminalView::toggle_vi_mode))
             .on_action(cx.listener(TerminalView::show_character_palette))
             .on_action(cx.listener(TerminalView::select_all))
+            .on_action(cx.listener(TerminalView::rerun_task))
             .on_key_down(cx.listener(Self::key_down))
             .on_mouse_down(
                 MouseButton::Right,
@@ -1396,7 +1491,7 @@ impl Render for TerminalView {
                         focused,
                         self.should_show_cursor(focused, cx),
                         self.block_below_cursor.clone(),
-                        self.embedded,
+                        self.mode.clone(),
                     ))
                     .when_some(self.render_scrollbar(cx), |div, scrollbar| {
                         div.child(scrollbar)
@@ -1522,7 +1617,6 @@ impl Item for TerminalView {
                 self.workspace.clone(),
                 workspace_id,
                 self.project.clone(),
-                false,
                 window,
                 cx,
             )
@@ -1605,7 +1699,7 @@ impl SerializableItem for TerminalView {
         alive_items: Vec<workspace::ItemId>,
         _window: &mut Window,
         cx: &mut App,
-    ) -> Task<gpui::Result<()>> {
+    ) -> Task<anyhow::Result<()>> {
         delete_unloaded_items(alive_items, workspace_id, "terminals", &TERMINAL_DB, cx)
     }
 
@@ -1616,7 +1710,7 @@ impl SerializableItem for TerminalView {
         _closing: bool,
         _: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Option<Task<gpui::Result<()>>> {
+    ) -> Option<Task<anyhow::Result<()>>> {
         let terminal = self.terminal().read(cx);
         if terminal.task().is_some() {
             return None;
@@ -1680,7 +1774,6 @@ impl SerializableItem for TerminalView {
                         workspace,
                         Some(workspace_id),
                         project.downgrade(),
-                        false,
                         window,
                         cx,
                     )

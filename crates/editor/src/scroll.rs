@@ -123,8 +123,9 @@ impl OngoingScroll {
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Copy, Clone, Default, PartialEq, Eq)]
 pub enum ScrollbarThumbState {
+    #[default]
     Idle,
     Hovered,
     Dragging,
@@ -157,6 +158,7 @@ pub struct ScrollManager {
     active_scrollbar: Option<ActiveScrollbarState>,
     visible_line_count: Option<f32>,
     forbid_vertical_scroll: bool,
+    minimap_thumb_state: Option<ScrollbarThumbState>,
 }
 
 impl ScrollManager {
@@ -172,6 +174,7 @@ impl ScrollManager {
             last_autoscroll: None,
             visible_line_count: None,
             forbid_vertical_scroll: false,
+            minimap_thumb_state: None,
         }
     }
 
@@ -352,6 +355,7 @@ impl ScrollManager {
     pub fn dragging_scrollbar_axis(&self) -> Option<Axis> {
         self.active_scrollbar
             .as_ref()
+            .filter(|scrollbar| scrollbar.thumb_state == ScrollbarThumbState::Dragging)
             .map(|scrollbar| scrollbar.axis)
     }
 
@@ -394,6 +398,45 @@ impl ScrollManager {
             self.active_scrollbar = new_state;
             cx.notify();
         }
+    }
+
+    pub fn set_is_hovering_minimap_thumb(&mut self, hovered: bool, cx: &mut Context<Editor>) {
+        self.update_minimap_thumb_state(
+            Some(if hovered {
+                ScrollbarThumbState::Hovered
+            } else {
+                ScrollbarThumbState::Idle
+            }),
+            cx,
+        );
+    }
+
+    pub fn set_is_dragging_minimap(&mut self, cx: &mut Context<Editor>) {
+        self.update_minimap_thumb_state(Some(ScrollbarThumbState::Dragging), cx);
+    }
+
+    pub fn hide_minimap_thumb(&mut self, cx: &mut Context<Editor>) {
+        self.update_minimap_thumb_state(None, cx);
+    }
+
+    pub fn is_dragging_minimap(&self) -> bool {
+        self.minimap_thumb_state
+            .is_some_and(|state| state == ScrollbarThumbState::Dragging)
+    }
+
+    fn update_minimap_thumb_state(
+        &mut self,
+        thumb_state: Option<ScrollbarThumbState>,
+        cx: &mut Context<Editor>,
+    ) {
+        if self.minimap_thumb_state != thumb_state {
+            self.minimap_thumb_state = thumb_state;
+            cx.notify();
+        }
+    }
+
+    pub fn minimap_thumb_state(&self) -> Option<ScrollbarThumbState> {
+        self.minimap_thumb_state
     }
 
     pub fn clamp_scroll_left(&mut self, max: f32) -> bool {
