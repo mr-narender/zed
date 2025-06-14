@@ -1010,7 +1010,6 @@ async fn test_peers_following_each_other(cx_a: &mut TestAppContext, cx_b: &mut T
     workspace_b.update_in(cx_b, |workspace, window, cx| {
         workspace.active_pane().update(cx, |pane, cx| {
             pane.close_inactive_items(&Default::default(), window, cx)
-                .unwrap()
                 .detach();
         });
     });
@@ -1611,6 +1610,8 @@ async fn test_following_across_workspaces(cx_a: &mut TestAppContext, cx_b: &mut 
         .root(cx_a)
         .unwrap();
 
+    executor.run_until_parked();
+
     workspace_a_project_b.update(cx_a2, |workspace, cx| {
         assert_eq!(workspace.project().read(cx).remote_id(), Some(project_b_id));
         assert!(workspace.is_being_followed(client_b.peer_id().unwrap()));
@@ -2066,7 +2067,7 @@ async fn share_workspace(
     workspace: &Entity<Workspace>,
     cx: &mut VisualTestContext,
 ) -> anyhow::Result<u64> {
-    let project = workspace.update(cx, |workspace, _| workspace.project().clone());
+    let project = workspace.read_with(cx, |workspace, _| workspace.project().clone());
     cx.read(ActiveCall::global)
         .update(cx, |call, cx| call.share_project(project, cx))
         .await

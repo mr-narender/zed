@@ -3,12 +3,14 @@ use std::{sync::Arc, time::Duration};
 use crate::schema::json_schema_for;
 use crate::ui::ToolCallCardHeader;
 use anyhow::{Context as _, Result, anyhow};
-use assistant_tool::{ActionLog, Tool, ToolCard, ToolResult, ToolUseStatus};
+use assistant_tool::{
+    ActionLog, Tool, ToolCard, ToolResult, ToolResultContent, ToolResultOutput, ToolUseStatus,
+};
 use futures::{Future, FutureExt, TryFutureExt};
 use gpui::{
     AnyWindowHandle, App, AppContext, Context, Entity, IntoElement, Task, WeakEntity, Window,
 };
-use language_model::{LanguageModelRequestMessage, LanguageModelToolSchemaFormat};
+use language_model::{LanguageModel, LanguageModelRequest, LanguageModelToolSchemaFormat};
 use project::Project;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -34,6 +36,10 @@ impl Tool for WebSearchTool {
         false
     }
 
+    fn may_perform_edits(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> String {
         "Search the web for information using your query. Use this when you need real-time information, facts, or data that might not be in your training. Results will include snippets and links from relevant web pages.".into()
     }
@@ -53,9 +59,10 @@ impl Tool for WebSearchTool {
     fn run(
         self: Arc<Self>,
         input: serde_json::Value,
-        _messages: &[LanguageModelRequestMessage],
+        _request: Arc<LanguageModelRequest>,
         _project: Entity<Project>,
         _action_log: Entity<ActionLog>,
+        _model: Arc<dyn LanguageModel>,
         _window: Option<AnyWindowHandle>,
         cx: &mut App,
     ) -> ToolResult {
@@ -72,9 +79,13 @@ impl Tool for WebSearchTool {
             let search_task = search_task.clone();
             async move {
                 let response = search_task.await.map_err(|err| anyhow!(err))?;
-                serde_json::to_string(&response)
-                    .context("Failed to serialize search results")
-                    .map(Into::into)
+                Ok(ToolResultOutput {
+                    content: ToolResultContent::Text(
+                        serde_json::to_string(&response)
+                            .context("Failed to serialize search results")?,
+                    ),
+                    output: Some(serde_json::to_value(response)?),
+                })
             }
         });
 
@@ -82,6 +93,18 @@ impl Tool for WebSearchTool {
             output,
             card: Some(cx.new(|cx| WebSearchToolCard::new(search_task, cx)).into()),
         }
+    }
+
+    fn deserialize_card(
+        self: Arc<Self>,
+        output: serde_json::Value,
+        _project: Entity<Project>,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> Option<assistant_tool::AnyToolCard> {
+        let output = serde_json::from_value::<WebSearchResponse>(output).ok()?;
+        let card = cx.new(|cx| WebSearchToolCard::new(Task::ready(Ok(output)), cx));
+        Some(card.into())
     }
 }
 
@@ -147,7 +170,7 @@ impl ToolCard for WebSearchToolCard {
                     .gap_1()
                     .children(response.results.iter().enumerate().map(|(index, result)| {
                         let title = result.title.clone();
-                        let url = result.url.clone();
+                        let url = SharedString::from(result.url.clone());
 
                         Button::new(("result", index), title)
                             .label_size(LabelSize::Small)

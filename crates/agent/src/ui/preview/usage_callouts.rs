@@ -2,7 +2,7 @@ use client::zed_urls;
 use component::{empty_example, example_group_with_title, single_example};
 use gpui::{AnyElement, App, IntoElement, RenderOnce, Window};
 use language_model::RequestUsage;
-use ui::{Callout, Color, Icon, IconName, IconSize, prelude::*};
+use ui::{Callout, prelude::*};
 use zed_llm_client::{Plan, UsageLimit};
 
 #[derive(IntoElement, RegisterComponent)]
@@ -39,7 +39,7 @@ impl RenderOnce for UsageCallout {
 
         let (title, message, button_text, url) = if is_limit_reached {
             match self.plan {
-                Plan::Free => (
+                Plan::ZedFree => (
                     "Out of free prompts",
                     "Upgrade to continue, wait for the next reset, or switch to API key."
                         .to_string(),
@@ -61,7 +61,7 @@ impl RenderOnce for UsageCallout {
             }
         } else {
             match self.plan {
-                Plan::Free => (
+                Plan::ZedFree => (
                     "Reaching free plan limit soon",
                     format!(
                         "{remaining} remaining - Upgrade to increase limit, or switch providers",
@@ -91,16 +91,23 @@ impl RenderOnce for UsageCallout {
                 .size(IconSize::XSmall)
         };
 
-        Callout::multi_line(
-            title,
-            message,
-            icon,
-            button_text,
-            Box::new(move |_, _, cx| {
-                cx.open_url(&url);
-            }),
-        )
-        .into_any_element()
+        div()
+            .border_t_1()
+            .border_color(cx.theme().colors().border)
+            .child(
+                Callout::new()
+                    .icon(icon)
+                    .title(title)
+                    .description(message)
+                    .primary_action(
+                        Button::new("upgrade", button_text)
+                            .label_size(LabelSize::Small)
+                            .on_click(move |_, _, cx| {
+                                cx.open_url(&url);
+                            }),
+                    ),
+            )
+            .into_any_element()
     }
 }
 
@@ -120,7 +127,7 @@ impl Component for UsageCallout {
                 single_example(
                     "Approaching limit (90%)",
                     UsageCallout::new(
-                        Plan::Free,
+                        Plan::ZedFree,
                         RequestUsage {
                             limit: UsageLimit::Limited(50),
                             amount: 45, // 90% of limit
@@ -131,7 +138,7 @@ impl Component for UsageCallout {
                 single_example(
                     "Limit reached (100%)",
                     UsageCallout::new(
-                        Plan::Free,
+                        Plan::ZedFree,
                         RequestUsage {
                             limit: UsageLimit::Limited(50),
                             amount: 50, // 100% of limit
@@ -189,10 +196,8 @@ impl Component for UsageCallout {
         );
 
         Some(
-            div()
+            v_flex()
                 .p_4()
-                .flex()
-                .flex_col()
                 .gap_4()
                 .child(free_examples)
                 .child(trial_examples)
