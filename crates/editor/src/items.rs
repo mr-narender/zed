@@ -1,6 +1,7 @@
 use crate::{
     Anchor, Autoscroll, Editor, EditorEvent, EditorSettings, ExcerptId, ExcerptRange, FormatTarget,
-    MultiBuffer, MultiBufferSnapshot, NavigationData, SearchWithinRange, ToPoint as _,
+    MultiBuffer, MultiBufferSnapshot, NavigationData, SearchWithinRange, SelectionEffects,
+    ToPoint as _,
     editor_settings::SeedQuerySetting,
     persistence::{DB, SerializedEditor},
     scroll::ScrollAnchor,
@@ -40,7 +41,7 @@ use ui::{IconDecorationKind, prelude::*};
 use util::{ResultExt, TryFutureExt, paths::PathExt};
 use workspace::{
     CollaboratorId, ItemId, ItemNavHistory, ToolbarItemLocation, ViewId, Workspace, WorkspaceId,
-    item::{FollowableItem, Item, ItemEvent, ProjectItem},
+    item::{FollowableItem, Item, ItemEvent, ProjectItem, SaveOptions},
     searchable::{Direction, SearchEvent, SearchableItem, SearchableItemHandle},
 };
 use workspace::{
@@ -372,7 +373,7 @@ impl FollowableItem for Editor {
         };
         drop(buffer);
         self.set_selections_from_remote(vec![selection], None, window, cx);
-        self.request_autoscroll_remotely(Autoscroll::center(), cx);
+        self.request_autoscroll_remotely(Autoscroll::fit(), cx);
     }
 }
 
@@ -445,7 +446,7 @@ async fn update_editor_from_message(
             }
 
             multibuffer.remove_excerpts(removed_excerpt_ids, cx);
-            Result::<(), anyhow::Error>::Ok(())
+            anyhow::Ok(())
         })
     })??;
 
@@ -611,12 +612,13 @@ impl Item for Editor {
             if newest_selection.head() == offset {
                 false
             } else {
-                let nav_history = self.nav_history.take();
                 self.set_scroll_anchor(scroll_anchor, window, cx);
-                self.change_selections(Some(Autoscroll::fit()), window, cx, |s| {
-                    s.select_ranges([offset..offset])
-                });
-                self.nav_history = nav_history;
+                self.change_selections(
+                    SelectionEffects::default().nav_history(false),
+                    window,
+                    cx,
+                    |s| s.select_ranges([offset..offset]),
+                );
                 true
             }
         } else {
@@ -805,7 +807,7 @@ impl Item for Editor {
 
     fn save(
         &mut self,
-        format: bool,
+        options: SaveOptions,
         project: Entity<Project>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -816,13 +818,25 @@ impl Item for Editor {
             .into_iter()
             .map(|handle| handle.read(cx).base_buffer().unwrap_or(handle.clone()))
             .collect::<HashSet<_>>();
+
+        // let mut buffers_to_save =
+        let buffers_to_save = if self.buffer.read(cx).is_singleton() && !options.autosave {
+            buffers.clone()
+        } else {
+            buffers
+                .iter()
+                .filter(|buffer| buffer.read(cx).is_dirty())
+                .cloned()
+                .collect()
+        };
+
         cx.spawn_in(window, async move |this, cx| {
-            if format {
+            if options.format {
                 this.update_in(cx, |editor, window, cx| {
                     editor.perform_format(
                         project.clone(),
                         FormatTrigger::Save,
-                        FormatTarget::Buffers,
+                        FormatTarget::Buffers(buffers_to_save.clone()),
                         window,
                         cx,
                     )
@@ -830,33 +844,28 @@ impl Item for Editor {
                 .await?;
             }
 
-            if buffers.len() == 1 {
-                // Apply full save routine for singleton buffers, to allow to `touch` the file via the editor.
+            if !buffers_to_save.is_empty() {
                 project
-                    .update(cx, |project, cx| project.save_buffers(buffers, cx))?
+                    .update(cx, |project, cx| {
+                        project.save_buffers(buffers_to_save.clone(), cx)
+                    })?
                     .await?;
-            } else {
-                // For multi-buffers, only format and save the buffers with changes.
-                // For clean buffers, we simulate saving by calling `Buffer::did_save`,
-                // so that language servers or other downstream listeners of save events get notified.
-                let (dirty_buffers, clean_buffers) = buffers.into_iter().partition(|buffer| {
-                    buffer
-                        .update(cx, |buffer, _| buffer.is_dirty() || buffer.has_conflict())
-                        .unwrap_or(false)
-                });
+            }
 
-                project
-                    .update(cx, |project, cx| project.save_buffers(dirty_buffers, cx))?
-                    .await?;
-                for buffer in clean_buffers {
-                    buffer
-                        .update(cx, |buffer, cx| {
-                            let version = buffer.saved_version().clone();
-                            let mtime = buffer.saved_mtime();
-                            buffer.did_save(version, mtime, cx);
-                        })
-                        .ok();
-                }
+            // Notify about clean buffers for language server events
+            let buffers_that_were_not_saved: Vec<_> = buffers
+                .into_iter()
+                .filter(|b| !buffers_to_save.contains(b))
+                .collect();
+
+            for buffer in buffers_that_were_not_saved {
+                buffer
+                    .update(cx, |buffer, cx| {
+                        let version = buffer.saved_version().clone();
+                        let mtime = buffer.saved_mtime();
+                        buffer.did_save(version, mtime, cx);
+                    })
+                    .ok();
             }
 
             Ok(())
@@ -1089,7 +1098,7 @@ impl SerializableItem for Editor {
                 let project = project.clone();
                 async move |cx| {
                     let language_registry =
-                        project.update(cx, |project, _| project.languages().clone())?;
+                        project.read_with(cx, |project, _| project.languages().clone())?;
 
                     let language = if let Some(language_name) = language {
                         // We don't fail here, because we'd rather not set the language if the name changed
@@ -1135,7 +1144,7 @@ impl SerializableItem for Editor {
                 mtime,
                 ..
             } => {
-                let project_item = project.update(cx, |project, cx| {
+                let opened_buffer = project.update(cx, |project, cx| {
                     let (worktree, path) = project.find_worktree(&abs_path, cx)?;
                     let project_path = ProjectPath {
                         worktree_id: worktree.read(cx).id(),
@@ -1144,13 +1153,10 @@ impl SerializableItem for Editor {
                     Some(project.open_path(project_path, cx))
                 });
 
-                match project_item {
-                    Some(project_item) => {
+                match opened_buffer {
+                    Some(opened_buffer) => {
                         window.spawn(cx, async move |cx| {
-                            let (_, project_item) = project_item.await?;
-                            let buffer = project_item.downcast::<Buffer>().map_err(|_| {
-                                anyhow!("Project item at stored path was not a buffer")
-                            })?;
+                            let (_, buffer) = opened_buffer.await?;
 
                             // This is a bit wasteful: we're loading the whole buffer from
                             // disk and then overwrite the content.
@@ -1225,6 +1231,9 @@ impl SerializableItem for Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Task<Result<()>>> {
+        if self.mode.is_minimap() {
+            return None;
+        }
         let mut serialize_dirty_buffers = self.serialize_dirty_buffers;
 
         let project = self.project.clone()?;
@@ -1382,7 +1391,7 @@ impl Editor {
         cx: &mut Context<Self>,
         write: impl for<'a> FnOnce(&'a mut RestorationData) + 'static,
     ) {
-        if !WorkspaceSettings::get(None, cx).restore_on_file_reopen {
+        if self.mode.is_minimap() || !WorkspaceSettings::get(None, cx).restore_on_file_reopen {
             return;
         }
 
@@ -2032,7 +2041,7 @@ mod tests {
         {
             let project = Project::test(fs.clone(), [path!("/file.rs").as_ref()], cx).await;
             // Add Rust to the language, so that we can restore the language of the buffer
-            project.update(cx, |project, _| project.languages().add(rust_language()));
+            project.read_with(cx, |project, _| project.languages().add(rust_language()));
 
             let (workspace, cx) =
                 cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
