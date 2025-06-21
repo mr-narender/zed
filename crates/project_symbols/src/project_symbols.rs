@@ -66,6 +66,7 @@ impl ProjectSymbolsDelegate {
             &self.visible_match_candidates,
             query,
             false,
+            true,
             MAX_MATCHES,
             &Default::default(),
             cx.background_executor().clone(),
@@ -74,6 +75,7 @@ impl ProjectSymbolsDelegate {
             &self.external_match_candidates,
             query,
             false,
+            true,
             MAX_MATCHES - visible_matches.len().min(MAX_MATCHES),
             &Default::default(),
             cx.background_executor().clone(),
@@ -139,7 +141,7 @@ impl PickerDelegate for ProjectSymbolsDelegate {
                         });
                     });
                 })?;
-                Ok::<_, anyhow::Error>(())
+                anyhow::Ok(())
             })
             .detach_and_log_err(cx);
             cx.emit(DismissEvent);
@@ -342,6 +344,7 @@ mod tests {
                             &candidates,
                             &params.query,
                             true,
+                            true,
                             100,
                             &Default::default(),
                             executor.clone(),
@@ -381,7 +384,7 @@ mod tests {
         });
 
         cx.run_until_parked();
-        symbols.update(cx, |symbols, _| {
+        symbols.read_with(cx, |symbols, _| {
             assert_eq!(symbols.delegate.matches.len(), 0);
         });
 
@@ -392,7 +395,7 @@ mod tests {
         });
 
         cx.run_until_parked();
-        symbols.update(cx, |symbols, _| {
+        symbols.read_with(cx, |symbols, _| {
             let delegate = &symbols.delegate;
             assert_eq!(delegate.matches.len(), 2);
             assert_eq!(delegate.matches[0].string, "ton");
@@ -406,7 +409,7 @@ mod tests {
         });
 
         cx.run_until_parked();
-        symbols.update(cx, |symbols, _| {
+        symbols.read_with(cx, |symbols, _| {
             assert_eq!(symbols.delegate.matches.len(), 0);
         });
     }

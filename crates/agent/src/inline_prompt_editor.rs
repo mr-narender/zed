@@ -1,4 +1,4 @@
-use crate::assistant_model_selector::{AssistantModelSelector, ModelType};
+use crate::agent_model_selector::AgentModelSelector;
 use crate::buffer_codegen::BufferCodegen;
 use crate::context::ContextCreasesAddon;
 use crate::context_picker::{ContextPicker, ContextPickerCompletionProvider};
@@ -7,13 +7,16 @@ use crate::context_strip::{ContextStrip, ContextStripEvent, SuggestContextKind};
 use crate::message_editor::{extract_message_creases, insert_message_creases};
 use crate::terminal_codegen::TerminalCodegen;
 use crate::thread_store::{TextThreadStore, ThreadStore};
-use crate::{CycleNextInlineAssist, CyclePreviousInlineAssist};
+use crate::{CycleNextInlineAssist, CyclePreviousInlineAssist, ModelUsageContext};
 use crate::{RemoveAllContext, ToggleContextPicker};
+use assistant_context_editor::language_model_selector::ToggleModelSelector;
 use client::ErrorExt;
 use collections::VecDeque;
+use db::kvp::Dismissable;
+use editor::actions::Paste;
+use editor::display_map::EditorMargins;
 use editor::{
-    ContextMenuOptions, Editor, EditorElement, EditorEvent, EditorMode, EditorStyle,
-    GutterDimensions, MultiBuffer,
+    ContextMenuOptions, Editor, EditorElement, EditorEvent, EditorMode, EditorStyle, MultiBuffer,
     actions::{MoveDown, MoveUp},
 };
 use feature_flags::{FeatureFlagAppExt as _, ZedProFeatureFlag};
@@ -23,17 +26,16 @@ use gpui::{
     Focusable, FontWeight, Subscription, TextStyle, WeakEntity, Window, anchored, deferred, point,
 };
 use language_model::{LanguageModel, LanguageModelRegistry};
-use language_model_selector::ToggleModelSelector;
 use parking_lot::Mutex;
 use settings::Settings;
 use std::cmp;
+use std::rc::Rc;
 use std::sync::Arc;
 use theme::ThemeSettings;
 use ui::utils::WithRemSize;
 use ui::{
     CheckboxWithLabel, IconButtonShape, KeyBinding, Popover, PopoverMenuHandle, Tooltip, prelude::*,
 };
-use util::ResultExt;
 use workspace::Workspace;
 
 pub struct PromptEditor<T> {
@@ -42,7 +44,7 @@ pub struct PromptEditor<T> {
     context_store: Entity<ContextStore>,
     context_strip: Entity<ContextStrip>,
     context_picker_menu_handle: PopoverMenuHandle<ContextPicker>,
-    model_selector: Entity<AssistantModelSelector>,
+    model_selector: Entity<AgentModelSelector>,
     edited_since_done: bool,
     prompt_history: VecDeque<String>,
     prompt_history_ix: Option<usize>,
@@ -61,11 +63,13 @@ impl<T: 'static> Render for PromptEditor<T> {
         let ui_font_size = ThemeSettings::get_global(cx).ui_font_size(cx);
         let mut buttons = Vec::new();
 
-        let left_gutter_width = match &self.mode {
+        const RIGHT_PADDING: Pixels = px(9.);
+
+        let (left_gutter_width, right_padding) = match &self.mode {
             PromptEditorMode::Buffer {
                 id: _,
                 codegen,
-                gutter_dimensions,
+                editor_margins,
             } => {
                 let codegen = codegen.read(cx);
 
@@ -73,13 +77,17 @@ impl<T: 'static> Render for PromptEditor<T> {
                     buttons.push(self.render_cycle_controls(&codegen, cx));
                 }
 
-                let gutter_dimensions = gutter_dimensions.lock();
+                let editor_margins = editor_margins.lock();
+                let gutter = editor_margins.gutter;
 
-                gutter_dimensions.full_width() + (gutter_dimensions.margin / 2.0)
+                let left_gutter_width = gutter.full_width() + (gutter.margin / 2.0);
+                let right_padding = editor_margins.right + RIGHT_PADDING;
+
+                (left_gutter_width, right_padding)
             }
             PromptEditorMode::Terminal { .. } => {
                 // Give the equivalent of the same left-padding that we're using on the right
-                Pixels::from(40.0)
+                (Pixels::from(40.0), Pixels::from(24.))
             }
         };
 
@@ -92,15 +100,16 @@ impl<T: 'static> Render for PromptEditor<T> {
 
         v_flex()
             .key_context("PromptEditor")
+            .capture_action(cx.listener(Self::paste))
             .bg(cx.theme().colors().editor_background)
-            .block_mouse_down()
+            .block_mouse_except_scroll()
             .gap_0p5()
             .border_y_1()
             .border_color(cx.theme().status().info_border)
             .size_full()
             .pt_0p5()
             .pb(bottom_padding)
-            .pr_6()
+            .pr(right_padding)
             .child(
                 h_flex()
                     .items_start()
@@ -252,7 +261,7 @@ impl<T: 'static> PromptEditor<T> {
 
         let focus = self.editor.focus_handle(cx).contains_focused(window, cx);
         self.editor = cx.new(|cx| {
-            let mut editor = Editor::auto_height(Self::MAX_LINES as usize, window, cx);
+            let mut editor = Editor::auto_height(1, Self::MAX_LINES as usize, window, cx);
             editor.set_soft_wrap_mode(language::language_settings::SoftWrap::EditorWidth, cx);
             editor.set_placeholder_text("Add a prompt…", cx);
             editor.set_text(prompt, window, cx);
@@ -284,16 +293,20 @@ impl<T: 'static> PromptEditor<T> {
             PromptEditorMode::Terminal { .. } => "Generate",
         };
 
-        let assistant_panel_keybinding =
+        let agent_panel_keybinding =
             ui::text_for_action(&zed_actions::assistant::ToggleFocus, window, cx)
                 .map(|keybinding| format!("{keybinding} to chat ― "))
                 .unwrap_or_default();
 
-        format!("{action}… ({assistant_panel_keybinding}↓↑ for history)")
+        format!("{action}… ({agent_panel_keybinding}↓↑ for history)")
     }
 
     pub fn prompt(&self, cx: &App) -> String {
         self.editor.read(cx).text(cx)
+    }
+
+    fn paste(&mut self, _: &Paste, _window: &mut Window, cx: &mut Context<Self>) {
+        crate::active_thread::attach_pasted_images_as_context(&self.context_store, cx);
     }
 
     fn toggle_rate_limit_notice(
@@ -320,9 +333,7 @@ impl<T: 'static> PromptEditor<T> {
             EditorEvent::Edited { .. } => {
                 if let Some(workspace) = window.root::<Workspace>().flatten() {
                     workspace.update(cx, |workspace, cx| {
-                        let is_via_ssh = workspace
-                            .project()
-                            .update(cx, |project, _| project.is_via_ssh());
+                        let is_via_ssh = workspace.project().read(cx).is_via_ssh();
 
                         workspace
                             .client()
@@ -367,7 +378,7 @@ impl<T: 'static> PromptEditor<T> {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.context_store.update(cx, |store, _cx| store.clear());
+        self.context_store.update(cx, |store, cx| store.clear(cx));
         cx.notify();
     }
 
@@ -392,9 +403,7 @@ impl<T: 'static> PromptEditor<T> {
             CodegenStatus::Idle => {
                 cx.emit(PromptEditorEvent::StartRequested);
             }
-            CodegenStatus::Pending => {
-                cx.emit(PromptEditorEvent::DismissRequested);
-            }
+            CodegenStatus::Pending => {}
             CodegenStatus::Done => {
                 if self.edited_since_done {
                     cx.emit(PromptEditorEvent::StartRequested);
@@ -445,7 +454,7 @@ impl<T: 'static> PromptEditor<T> {
                     editor.move_to_end(&Default::default(), window, cx)
                 });
             }
-        } else {
+        } else if self.context_strip.read(cx).has_context_items(cx) {
             self.context_strip.focus_handle(cx).focus(window);
         }
     }
@@ -716,7 +725,7 @@ impl<T: 'static> PromptEditor<T> {
                         .child(CheckboxWithLabel::new(
                             "dont-show-again",
                             Label::new("Don't show again"),
-                            if dismissed_rate_limit_notice() {
+                            if RateLimitNotice::dismissed() {
                                 ui::ToggleState::Selected
                             } else {
                                 ui::ToggleState::Unselected
@@ -728,7 +737,7 @@ impl<T: 'static> PromptEditor<T> {
                                     ui::ToggleState::Selected => true,
                                 };
 
-                                set_rate_limit_notice_dismissed(is_dismissed, cx)
+                                RateLimitNotice::set_dismissed(is_dismissed, cx);
                             },
                         ))
                         .child(
@@ -806,7 +815,7 @@ pub enum PromptEditorMode {
     Buffer {
         id: InlineAssistId,
         codegen: Entity<BufferCodegen>,
-        gutter_dimensions: Arc<Mutex<GutterDimensions>>,
+        editor_margins: Arc<Mutex<EditorMargins>>,
     },
     Terminal {
         id: TerminalInlineAssistId,
@@ -820,7 +829,6 @@ pub enum PromptEditorEvent {
     StopRequested,
     ConfirmRequested { execute: bool },
     CancelRequested,
-    DismissRequested,
     Resized { height_in_lines: u8 },
 }
 
@@ -838,7 +846,7 @@ impl InlineAssistId {
 impl PromptEditor<BufferCodegen> {
     pub fn new_buffer(
         id: InlineAssistId,
-        gutter_dimensions: Arc<Mutex<GutterDimensions>>,
+        editor_margins: Arc<Mutex<EditorMargins>>,
         prompt_history: VecDeque<String>,
         prompt_buffer: Entity<MultiBuffer>,
         codegen: Entity<BufferCodegen>,
@@ -855,12 +863,13 @@ impl PromptEditor<BufferCodegen> {
         let mode = PromptEditorMode::Buffer {
             id,
             codegen,
-            gutter_dimensions,
+            editor_margins,
         };
 
         let prompt_editor = cx.new(|cx| {
             let mut editor = Editor::new(
                 EditorMode::AutoHeight {
+                    min_lines: 1,
                     max_lines: Self::MAX_LINES as usize,
                 },
                 prompt_buffer,
@@ -886,7 +895,7 @@ impl PromptEditor<BufferCodegen> {
 
         let prompt_editor_entity = prompt_editor.downgrade();
         prompt_editor.update(cx, |editor, _| {
-            editor.set_completion_provider(Some(Box::new(ContextPickerCompletionProvider::new(
+            editor.set_completion_provider(Some(Rc::new(ContextPickerCompletionProvider::new(
                 workspace.clone(),
                 context_store.downgrade(),
                 thread_store.clone(),
@@ -907,6 +916,7 @@ impl PromptEditor<BufferCodegen> {
                 text_thread_store.clone(),
                 context_picker_menu_handle.clone(),
                 SuggestContextKind::Thread,
+                ModelUsageContext::InlineAssistant,
                 window,
                 cx,
             )
@@ -921,11 +931,11 @@ impl PromptEditor<BufferCodegen> {
             context_strip,
             context_picker_menu_handle,
             model_selector: cx.new(|cx| {
-                AssistantModelSelector::new(
+                AgentModelSelector::new(
                     fs,
                     model_selector_menu_handle,
                     prompt_editor.focus_handle(cx),
-                    ModelType::InlineAssistant,
+                    ModelUsageContext::InlineAssistant,
                     window,
                     cx,
                 )
@@ -968,7 +978,7 @@ impl PromptEditor<BufferCodegen> {
             CodegenStatus::Error(error) => {
                 if cx.has_flag::<ZedProFeatureFlag>()
                     && error.error_code() == proto::ErrorCode::RateLimitExceeded
-                    && !dismissed_rate_limit_notice()
+                    && !RateLimitNotice::dismissed()
                 {
                     self.show_rate_limit_notice = true;
                     cx.notify();
@@ -995,11 +1005,9 @@ impl PromptEditor<BufferCodegen> {
         }
     }
 
-    pub fn gutter_dimensions(&self) -> &Arc<Mutex<GutterDimensions>> {
+    pub fn editor_margins(&self) -> &Arc<Mutex<EditorMargins>> {
         match &self.mode {
-            PromptEditorMode::Buffer {
-                gutter_dimensions, ..
-            } => gutter_dimensions,
+            PromptEditorMode::Buffer { editor_margins, .. } => editor_margins,
             PromptEditorMode::Terminal { .. } => unreachable!(),
         }
     }
@@ -1040,6 +1048,7 @@ impl PromptEditor<TerminalCodegen> {
         let prompt_editor = cx.new(|cx| {
             let mut editor = Editor::new(
                 EditorMode::AutoHeight {
+                    min_lines: 1,
                     max_lines: Self::MAX_LINES as usize,
                 },
                 prompt_buffer,
@@ -1059,7 +1068,7 @@ impl PromptEditor<TerminalCodegen> {
 
         let prompt_editor_entity = prompt_editor.downgrade();
         prompt_editor.update(cx, |editor, _| {
-            editor.set_completion_provider(Some(Box::new(ContextPickerCompletionProvider::new(
+            editor.set_completion_provider(Some(Rc::new(ContextPickerCompletionProvider::new(
                 workspace.clone(),
                 context_store.downgrade(),
                 thread_store.clone(),
@@ -1080,6 +1089,7 @@ impl PromptEditor<TerminalCodegen> {
                 text_thread_store.clone(),
                 context_picker_menu_handle.clone(),
                 SuggestContextKind::Thread,
+                ModelUsageContext::InlineAssistant,
                 window,
                 cx,
             )
@@ -1094,11 +1104,11 @@ impl PromptEditor<TerminalCodegen> {
             context_strip,
             context_picker_menu_handle,
             model_selector: cx.new(|cx| {
-                AssistantModelSelector::new(
+                AgentModelSelector::new(
                     fs,
                     model_selector_menu_handle.clone(),
                     prompt_editor.focus_handle(cx),
-                    ModelType::InlineAssistant,
+                    ModelUsageContext::InlineAssistant,
                     window,
                     cx,
                 )
@@ -1176,27 +1186,10 @@ impl PromptEditor<TerminalCodegen> {
     }
 }
 
-const DISMISSED_RATE_LIMIT_NOTICE_KEY: &str = "dismissed-rate-limit-notice";
+struct RateLimitNotice;
 
-fn dismissed_rate_limit_notice() -> bool {
-    db::kvp::KEY_VALUE_STORE
-        .read_kvp(DISMISSED_RATE_LIMIT_NOTICE_KEY)
-        .log_err()
-        .map_or(false, |s| s.is_some())
-}
-
-fn set_rate_limit_notice_dismissed(is_dismissed: bool, cx: &mut App) {
-    db::write_and_log(cx, move || async move {
-        if is_dismissed {
-            db::kvp::KEY_VALUE_STORE
-                .write_kvp(DISMISSED_RATE_LIMIT_NOTICE_KEY.into(), "1".into())
-                .await
-        } else {
-            db::kvp::KEY_VALUE_STORE
-                .delete_kvp(DISMISSED_RATE_LIMIT_NOTICE_KEY.into())
-                .await
-        }
-    })
+impl Dismissable for RateLimitNotice {
+    const KEY: &'static str = "dismissed-rate-limit-notice";
 }
 
 pub enum CodegenStatus {

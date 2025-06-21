@@ -29,7 +29,7 @@ impl TryFrom<String> for Role {
             "assistant" => Ok(Self::Assistant),
             "system" => Ok(Self::System),
             "tool" => Ok(Self::Tool),
-            _ => Err(anyhow!("invalid role '{value}'")),
+            _ => anyhow::bail!("invalid role '{value}'"),
         }
     }
 }
@@ -58,8 +58,8 @@ pub enum Model {
         name: String,
         /// The name displayed in the UI, such as in the assistant panel model dropdown menu.
         display_name: Option<String>,
-        max_tokens: usize,
-        max_output_tokens: Option<u32>,
+        max_tokens: u64,
+        max_output_tokens: Option<u64>,
     },
 }
 
@@ -72,7 +72,7 @@ impl Model {
         match id {
             "deepseek-chat" => Ok(Self::Chat),
             "deepseek-reasoner" => Ok(Self::Reasoner),
-            _ => Err(anyhow!("invalid model id")),
+            _ => anyhow::bail!("invalid model id {id}"),
         }
     }
 
@@ -94,14 +94,14 @@ impl Model {
         }
     }
 
-    pub fn max_token_count(&self) -> usize {
+    pub fn max_token_count(&self) -> u64 {
         match self {
             Self::Chat | Self::Reasoner => 64_000,
             Self::Custom { max_tokens, .. } => *max_tokens,
         }
     }
 
-    pub fn max_output_tokens(&self) -> Option<u32> {
+    pub fn max_output_tokens(&self) -> Option<u64> {
         match self {
             Self::Chat => Some(8_192),
             Self::Reasoner => Some(8_192),
@@ -118,7 +118,7 @@ pub struct Request {
     pub messages: Vec<RequestMessage>,
     pub stream: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_tokens: Option<u32>,
+    pub max_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -296,10 +296,10 @@ pub async fn stream_completion(
     } else {
         let mut body = String::new();
         response.body_mut().read_to_string(&mut body).await?;
-        Err(anyhow!(
+        anyhow::bail!(
             "Failed to connect to DeepSeek API: {} {}",
             response.status(),
             body,
-        ))
+        );
     }
 }

@@ -342,7 +342,7 @@ impl BladeRenderer {
         let surface = context
             .gpu
             .create_surface_configured(window, surface_config)
-            .unwrap();
+            .map_err(|err| anyhow::anyhow!("Failed to create surface: {err:?}"))?;
 
         let command_encoder = context.gpu.create_command_encoder(gpu::CommandEncoderDesc {
             name: "main",
@@ -769,6 +769,7 @@ impl BladeRenderer {
                                                     >,
                                             )
                                             .unwrap(),
+                                            gpu::TexelAspects::COLOR,
                                         ),
                                         gpu::TextureView::from_metal_texture(
                                             &objc2::rc::Retained::retain(
@@ -780,6 +781,7 @@ impl BladeRenderer {
                                                     >,
                                             )
                                             .unwrap(),
+                                            gpu::TexelAspects::COLOR,
                                         ),
                                     )
                                 };

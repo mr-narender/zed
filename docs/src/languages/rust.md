@@ -78,7 +78,7 @@ If you want to disable Zed looking for a `rust-analyzer` binary, you can set `ig
 }
 ```
 
-If you want to use a binary in a custom location, you can specify a `path` and optional `args`:
+If you want to use a binary in a custom location, you can specify a `path` and optional `arguments`:
 
 ```json
 {
@@ -86,7 +86,7 @@ If you want to use a binary in a custom location, you can specify a `path` and o
     "rust-analyzer": {
       "binary": {
         "path": "/Users/example/bin/rust-analyzer",
-        "args": []
+        "arguments": []
       }
     }
   }
@@ -127,7 +127,7 @@ This is enabled by default and can be configured as
 ```json
 "lsp": {
   "rust-analyzer": {
-    enable_lsp_tasks": true,
+    "enable_lsp_tasks": true,
   }
 }
 ```

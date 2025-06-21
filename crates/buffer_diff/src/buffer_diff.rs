@@ -1028,7 +1028,11 @@ impl BufferDiff {
         let (base_text_changed, mut changed_range) =
             match (state.base_text_exists, new_state.base_text_exists) {
                 (false, false) => (true, None),
-                (true, true) if state.base_text.remote_id() == new_state.base_text.remote_id() => {
+                (true, true)
+                    if state.base_text.remote_id() == new_state.base_text.remote_id()
+                        && state.base_text.syntax_update_count()
+                            == new_state.base_text.syntax_update_count() =>
+                {
                     (false, new_state.compare(&state, buffer))
                 }
                 _ => (true, Some(text::Anchor::MIN..text::Anchor::MAX)),
@@ -1346,9 +1350,7 @@ mod tests {
 
     #[ctor::ctor]
     fn init_logger() {
-        if std::env::var("RUST_LOG").is_ok() {
-            env_logger::init();
-        }
+        zlog::init_test();
     }
 
     #[gpui::test]
