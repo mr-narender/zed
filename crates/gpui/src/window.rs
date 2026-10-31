@@ -483,10 +483,10 @@ impl ArenaClearNeeded {
     /// reference.
     pub fn clear(self, cx: &mut App) {
         assert!(
-            std::ptr::eq(self.arena, &cx.element_arena),
+            std::ptr::eq(self.arena, &*cx.element_arena),
             "ArenaClearNeeded::clear called with a different App than the draw ran against"
         );
-        cx.element_arena.borrow_mut().clear();
+        RefCell::borrow_mut(&cx.element_arena).clear();
     }
 }
 
@@ -3075,6 +3075,11 @@ impl Window {
     pub fn set_client_inset(&mut self, inset: Pixels) {
         self.client_inset = Some(inset);
         self.platform_window.set_client_inset(inset);
+    }
+
+    /// Sets the client-drawn corner radii so platform effects can match the window's shape.
+    pub fn set_client_corner_radii(&mut self, radii: Corners<Pixels>) {
+        self.platform_window.set_client_corner_radii(radii);
     }
 
     /// Returns the client_inset value by [`Self::set_client_inset`].
@@ -6214,9 +6219,11 @@ impl Window {
                     accepts
                 });
 
+            let standalone_modifier = matches!(currently_pending.keystrokes.as_slice(), [keystroke] if keystroke.is_modifier_key());
             let needs_timeout = previous_timeout.is_some()
                 || match_result.pending_has_binding
-                || text_input_requires_timeout;
+                || text_input_requires_timeout
+                || standalone_modifier;
             currently_pending.timeout = if needs_timeout {
                 match previous_timeout {
                     Some(mut timeout) if timeout.is_paused() => {
@@ -9986,6 +9993,122 @@ mod tests {
             .collect()
     }
 
+    actions!(window_test, [StandaloneModifierAction]);
+
+    struct StandaloneModifierView {
+        focus_handle: FocusHandle,
+        action_count: usize,
+    }
+
+    impl Render for StandaloneModifierView {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .key_context("StandaloneModifier")
+                .track_focus(&self.focus_handle)
+                .on_action(cx.listener(|this, _: &StandaloneModifierAction, _, _| {
+                    this.action_count += 1;
+                }))
+        }
+    }
+
+    #[gpui::test]
+    fn test_standalone_modifier_sequence_timeout_and_recovery(cx: &mut TestAppContext) {
+        use crate::{KeyBinding, Modifiers};
+
+        cx.update(|cx| {
+            cx.bind_keys([KeyBinding::new(
+                "shift shift",
+                StandaloneModifierAction,
+                Some("StandaloneModifier"),
+            )]);
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle, cx);
+            StandaloneModifierView {
+                focus_handle,
+                action_count: 0,
+            }
+        });
+        let shift = Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        };
+        cx.simulate_modifiers_change(shift);
+        cx.simulate_modifiers_change(Modifiers::default());
+        cx.update(|window, _| {
+            assert_eq!(
+                window.pending_input_keystrokes(),
+                Some([Keystroke::parse("shift").expect("valid keystroke")].as_slice())
+            );
+        });
+        cx.background_executor.advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert!(!window.has_pending_keystrokes());
+            assert_eq!(view.read(cx).action_count, 0);
+        });
+
+        cx.simulate_modifiers_change(shift);
+        cx.simulate_modifiers_change(Modifiers::default());
+        cx.update(|window, cx| {
+            assert!(window.has_pending_keystrokes());
+            assert_eq!(view.read(cx).action_count, 0);
+        });
+
+        cx.simulate_modifiers_change(shift);
+        cx.simulate_modifiers_change(Modifiers::default());
+        cx.update(|window, cx| {
+            assert!(!window.has_pending_keystrokes());
+            assert_eq!(view.read(cx).action_count, 1);
+        });
+    }
+
+    #[gpui::test]
+    fn test_standalone_modifier_sequence_dispatches_before_timeout(cx: &mut TestAppContext) {
+        use crate::{KeyBinding, Modifiers};
+
+        cx.update(|cx| {
+            cx.bind_keys([KeyBinding::new(
+                "shift shift",
+                StandaloneModifierAction,
+                Some("StandaloneModifier"),
+            )]);
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle, cx);
+            StandaloneModifierView {
+                focus_handle,
+                action_count: 0,
+            }
+        });
+        let shift = Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        };
+        cx.simulate_modifiers_change(shift);
+        cx.simulate_modifiers_change(Modifiers::default());
+        cx.background_executor
+            .advance_clock(Duration::from_millis(500));
+        cx.update(|window, cx| {
+            assert!(window.has_pending_keystrokes());
+            assert_eq!(view.read(cx).action_count, 0);
+        });
+        cx.simulate_modifiers_change(shift);
+        cx.simulate_modifiers_change(Modifiers::default());
+        cx.update(|window, cx| {
+            assert!(!window.has_pending_keystrokes());
+            assert_eq!(view.read(cx).action_count, 1);
+        });
+        cx.background_executor.advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert!(!window.has_pending_keystrokes());
+            assert_eq!(view.read(cx).action_count, 1);
+        });
+    }
+
     fn dispatch_touch<T: 'static>(
         window: crate::WindowHandle<T>,
         cx: &mut TestAppContext,
@@ -10008,6 +10131,111 @@ mod tests {
                 );
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn cached_view_follows_inherited_opacity(cx: &mut TestAppContext) {
+        struct Child {
+            renders: usize,
+        }
+
+        impl Render for Child {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                self.renders += 1;
+                div().size_full().bg(crate::rgb(0xff0000))
+            }
+        }
+
+        struct Root {
+            opacity: f32,
+            width: Pixels,
+            child: crate::Entity<Child>,
+        }
+
+        impl Render for Root {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .w(self.width)
+                    .h(px(200.))
+                    .opacity(self.opacity)
+                    .hover(|style| style.opacity(1.))
+                    .child(
+                        self.child
+                            .clone()
+                            .cached(crate::StyleRefinement::default().size(px(100.))),
+                    )
+            }
+        }
+
+        /// Updates the root, draws until no more frames are requested, and returns the
+        /// child's painted alpha and how many times it has rendered.
+        fn update_and_draw(
+            window: crate::WindowHandle<Root>,
+            child: &crate::Entity<Child>,
+            cx: &mut TestAppContext,
+            update: impl FnOnce(&mut Root, &mut Window, &mut Context<Root>),
+        ) -> (f32, usize) {
+            window
+                .update(cx, |root, window, cx| {
+                    update(root, window, cx);
+                    cx.notify();
+                })
+                .expect("update root");
+            for _ in 0..3 {
+                let (alpha, renders, requested_frames) = cx
+                    .update_window(window.into(), |_, window, cx| {
+                        window.draw(cx).clear(cx);
+                        let quads = &window.rendered_frame.scene.quads;
+                        assert_eq!(quads.len(), 1);
+                        let alpha = quads.first().expect("child quad").background.solid.a;
+                        (
+                            alpha,
+                            child.read(cx).renders,
+                            window.simulate_next_frame(cx),
+                        )
+                    })
+                    .expect("draw window");
+                if requested_frames == 0 {
+                    return (alpha, renders);
+                }
+            }
+            panic!("cached child kept requesting frames");
+        }
+
+        let child = cx.new(|_| Child { renders: 0 });
+        let window = cx.add_window(|_, _| Root {
+            opacity: 1.,
+            width: px(200.),
+            child: child.clone(),
+        });
+        let outside = point(px(500.), px(500.));
+        let inside = point(px(50.), px(50.));
+        let beside = point(px(250.), px(50.));
+
+        // Changing the wrapper's opacity redraws the child; unchanged opacity reuses it.
+        let move_outside = |_: &mut Root, window: &mut Window, cx: &mut Context<Root>| {
+            window.simulate_mouse_move(outside, cx)
+        };
+        assert_eq!(update_and_draw(window, &child, cx, move_outside), (1., 1));
+        assert_eq!(update_and_draw(window, &child, cx, |_, _, _| {}), (1., 1));
+        let fade = |root: &mut Root, _: &mut Window, _: &mut Context<Root>| root.opacity = 0.5;
+        assert_eq!(update_and_draw(window, &child, cx, fade), (0.5, 2));
+        assert_eq!(update_and_draw(window, &child, cx, |_, _, _| {}), (0.5, 2));
+
+        // Hover opacity applies when the mouse enters and leaves.
+        let move_inside = |_: &mut Root, window: &mut Window, cx: &mut Context<Root>| {
+            window.simulate_mouse_move(inside, cx)
+        };
+        assert_eq!(update_and_draw(window, &child, cx, move_inside).0, 1.);
+        let move_beside = |_: &mut Root, window: &mut Window, cx: &mut Context<Root>| {
+            window.simulate_mouse_move(beside, cx)
+        };
+        assert_eq!(update_and_draw(window, &child, cx, move_beside).0, 0.5);
+
+        // Widening the wrapper puts it under a still mouse, so only paint's hit test sees
+        // the hover.
+        let widen = |root: &mut Root, _: &mut Window, _: &mut Context<Root>| root.width = px(300.);
+        assert_eq!(update_and_draw(window, &child, cx, widen).0, 1.);
     }
 }
 
