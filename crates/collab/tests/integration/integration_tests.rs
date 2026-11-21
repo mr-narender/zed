@@ -1631,7 +1631,7 @@ async fn assert_lsp_log_streams_reconnect(
         LanguageConfig {
             name: "Rust".into(),
             matcher: LanguageMatcher {
-                path_suffixes: vec!["rs".to_string()],
+                path_suffixes: vec!["rs".into()],
                 ..Default::default()
             }
             .into(),
@@ -2921,7 +2921,7 @@ async fn test_propagate_saves_and_fs_changes(
         LanguageConfig {
             name: "Rust".into(),
             matcher: (LanguageMatcher {
-                path_suffixes: vec!["rs".to_string()],
+                path_suffixes: vec!["rs".into()],
                 ..Default::default()
             })
             .into(),
@@ -2933,7 +2933,7 @@ async fn test_propagate_saves_and_fs_changes(
         LanguageConfig {
             name: "JavaScript".into(),
             matcher: (LanguageMatcher {
-                path_suffixes: vec!["js".to_string()],
+                path_suffixes: vec!["js".into()],
                 ..Default::default()
             })
             .into(),
@@ -4805,7 +4805,7 @@ async fn test_collaborating_with_diagnostics(
         LanguageConfig {
             name: "Rust".into(),
             matcher: (LanguageMatcher {
-                path_suffixes: vec!["rs".to_string()],
+                path_suffixes: vec!["rs".into()],
                 ..Default::default()
             })
             .into(),
@@ -5524,13 +5524,11 @@ async fn test_prettier_formatting_buffer(
         .await;
     let active_call_a = cx_a.read(ActiveCall::global);
 
-    let test_plugin = "test_plugin";
-
     client_a.language_registry().add(Arc::new(Language::new(
         LanguageConfig {
             name: "TypeScript".into(),
             matcher: (LanguageMatcher {
-                path_suffixes: vec!["ts".to_string()],
+                path_suffixes: vec!["ts".into()],
                 ..Default::default()
             })
             .into(),
@@ -5538,13 +5536,9 @@ async fn test_prettier_formatting_buffer(
         },
         Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
     )));
-    let mut fake_language_servers = client_a.language_registry().register_fake_lsp(
-        "TypeScript",
-        FakeLspAdapter {
-            prettier_plugins: vec![test_plugin],
-            ..Default::default()
-        },
-    );
+    let mut fake_language_servers = client_a
+        .language_registry()
+        .register_fake_lsp("TypeScript", FakeLspAdapter::default());
 
     // Here we insert a fake tree with a directory that exists on disk. This is needed
     // because later we'll invoke a command, which requires passing a working directory
@@ -7277,7 +7271,7 @@ async fn test_contacts(
                 .iter()
                 .map(|contact| {
                     (
-                        contact.user.username.clone().to_string(),
+                        contact.user.username.to_string(),
                         if contact.online { "online" } else { "offline" },
                         if contact.busy { "busy" } else { "free" },
                     )
