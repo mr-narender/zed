@@ -29,11 +29,14 @@
 //! }
 //! ```
 
-use crate::remote_client::{
-    ChannelClient, CommandTemplate, Interactive, RemoteClientDelegate, RemoteConnection,
-    RemoteConnectionOptions,
+use crate::{
+    command::RemoteCommand,
+    remote_client::{
+        ChannelClient, CommandTemplate, Interactive, RemoteClientDelegate, RemoteConnection,
+        RemoteConnectionOptions,
+    },
 };
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use async_trait::async_trait;
 use collections::HashMap;
 use futures::{
@@ -47,6 +50,7 @@ use futures::{
 use gpui::{App, AppContext as _, AsyncApp, Global, Task, TestAppContext};
 use rpc::{AnyProtoClient, proto::Envelope};
 use std::{
+    net::SocketAddr,
     path::PathBuf,
     sync::{
         Arc,
@@ -64,8 +68,21 @@ pub struct MockConnectionOptions {
 /// A mock implementation of `RemoteConnection` for testing.
 pub struct MockRemoteConnection {
     options: MockConnectionOptions,
+    tcp_proxy: bool,
     server_channel: Arc<ChannelClient>,
     server_cx: SendableCx,
+    message_interceptors: parking_lot::Mutex<Option<MessageInterceptors>>,
+    path_style: parking_lot::Mutex<PathStyle>,
+    reported_options: parking_lot::Mutex<Option<RemoteConnectionOptions>>,
+    pub(crate) proxy_tx: parking_lot::Mutex<
+        Option<
+            mpsc::UnboundedSender<(
+                mpsc::UnboundedSender<Envelope>,
+                mpsc::UnboundedReceiver<Envelope>,
+            )>,
+        >,
+    >,
+    pub(crate) proxy_exit_code: parking_lot::Mutex<Option<i32>>,
 }
 
 /// Wrapper to pass `AsyncApp` across thread boundaries in tests.
@@ -104,6 +121,17 @@ pub struct MockConnectionRegistry {
 impl Global for MockConnectionRegistry {}
 
 impl MockConnectionRegistry {
+    pub fn enable_tcp_proxy(&mut self, options: &MockConnectionOptions) -> Result<()> {
+        let (_, connection) = self
+            .pending
+            .get_mut(&options.id)
+            .context("Missing mock connection")?;
+        Arc::get_mut(connection)
+            .context("Mock connection already shared")?
+            .tcp_proxy = true;
+        Ok(())
+    }
+
     /// Called by `ConnectionPool::connect` to retrieve a pre-registered mock connection.
     pub fn take(
         &mut self,
@@ -123,6 +151,48 @@ pub struct MockConnection;
 pub type ConnectGuard = oneshot::Sender<()>;
 
 impl MockConnection {
+    pub fn intercept_messages(
+        options: &RemoteConnectionOptions,
+        cx: &mut App,
+        client_to_server: impl Fn(&mut Envelope) + Send + Sync + 'static,
+        server_to_client: impl Fn(&mut Envelope) + Send + Sync + 'static,
+    ) {
+        *Self::pending(options, cx).message_interceptors.lock() = Some(MessageInterceptors {
+            client_to_server: Arc::new(client_to_server),
+            server_to_client: Arc::new(server_to_client),
+        });
+    }
+
+    /// Makes the connection report `path_style`, as a connection to a host of another OS would.
+    pub fn set_path_style(options: &RemoteConnectionOptions, path_style: PathStyle, cx: &mut App) {
+        *Self::pending(options, cx).path_style.lock() = path_style;
+    }
+
+    /// Makes the connection report `reported` as its options, as a real connection reports the
+    /// options it was opened with, such as a saved SSH connection.
+    pub fn report_connection_options(
+        options: &RemoteConnectionOptions,
+        reported: RemoteConnectionOptions,
+        cx: &mut App,
+    ) {
+        *Self::pending(options, cx).reported_options.lock() = Some(reported);
+    }
+
+    fn pending<'a>(
+        options: &RemoteConnectionOptions,
+        cx: &'a App,
+    ) -> &'a Arc<MockRemoteConnection> {
+        let RemoteConnectionOptions::Mock(options) = options else {
+            panic!("this requires a mock connection");
+        };
+        let (_, connection) = cx
+            .global::<MockConnectionRegistry>()
+            .pending
+            .get(&options.id)
+            .expect("the mock connection must be configured before connecting");
+        connection
+    }
+
     /// Creates a new mock connection pair for testing.
     ///
     /// This function:
@@ -167,8 +237,14 @@ impl MockConnection {
 
         let connection = Arc::new(MockRemoteConnection {
             options: opts.clone(),
+            tcp_proxy: false,
             server_channel: server_client.clone(),
             server_cx: SendableCx::new(server_cx),
+            message_interceptors: parking_lot::Mutex::new(None),
+            path_style: parking_lot::Mutex::new(PathStyle::local()),
+            reported_options: parking_lot::Mutex::new(None),
+            proxy_tx: Default::default(),
+            proxy_exit_code: Default::default(),
         });
 
         let (tx, rx) = oneshot::channel();
@@ -183,6 +259,12 @@ impl MockConnection {
     }
 }
 
+#[derive(Clone)]
+struct MessageInterceptors {
+    client_to_server: Arc<dyn Fn(&mut Envelope) + Send + Sync>,
+    server_to_client: Arc<dyn Fn(&mut Envelope) + Send + Sync>,
+}
+
 #[async_trait(?Send)]
 impl RemoteConnection for MockRemoteConnection {
     async fn kill(&self) -> Result<()> {
@@ -193,17 +275,57 @@ impl RemoteConnection for MockRemoteConnection {
         false
     }
 
+    fn tcp_proxy_commands(
+        &self,
+        address: SocketAddr,
+        timeout: u64,
+        program: Option<&str>,
+        args: &[String],
+    ) -> Result<Option<(CommandTemplate, CommandTemplate)>> {
+        if !self.tcp_proxy {
+            return Ok(None);
+        }
+        let proxy_program = "mock-remote-server".to_owned();
+        let mut arguments = vec!["tcp".into(), address.to_string(), timeout.to_string()];
+        let attach_arguments = arguments.clone();
+        if let Some(program) = program {
+            arguments.extend(["--".into(), program.into()]);
+            arguments.extend_from_slice(args);
+        }
+        Ok(Some((
+            CommandTemplate {
+                program: proxy_program.clone(),
+                args: arguments,
+                env: Default::default(),
+            },
+            CommandTemplate {
+                program: proxy_program,
+                args: attach_arguments,
+                env: Default::default(),
+            },
+        )))
+    }
+
     fn build_command(
         &self,
         program: Option<String>,
         args: &[String],
         env: &HashMap<String, String>,
-        _working_dir: Option<String>,
+        working_dir: Option<String>,
         _port_forward: Option<(u16, String, u16)>,
-        _interactive: Interactive,
+        interactive: Interactive,
     ) -> Result<CommandTemplate> {
         let shell_program = program.unwrap_or_else(|| "sh".to_string());
         let mut shell_args = Vec::new();
+        match interactive {
+            Interactive::Yes => shell_args.push("-t".to_string()),
+            Interactive::No => shell_args.push("-T".to_string()),
+        }
+        if self.tcp_proxy
+            && let Some(working_dir) = working_dir
+        {
+            shell_args.extend(["-w".into(), working_dir]);
+        }
         shell_args.push(shell_program);
         shell_args.extend(args.iter().cloned());
         Ok(CommandTemplate {
@@ -211,6 +333,10 @@ impl RemoteConnection for MockRemoteConnection {
             args: shell_args,
             env: env.clone(),
         })
+    }
+
+    fn build_stdio_command(&self, command: RemoteCommand) -> Result<(CommandTemplate, Vec<u8>)> {
+        stdio_bootstrap_command(command)
     }
 
     fn build_forward_ports_command(
@@ -238,14 +364,19 @@ impl RemoteConnection for MockRemoteConnection {
     }
 
     fn connection_options(&self) -> RemoteConnectionOptions {
-        RemoteConnectionOptions::Mock(self.options.clone())
+        self.reported_options
+            .lock()
+            .clone()
+            .unwrap_or_else(|| RemoteConnectionOptions::Mock(self.options.clone()))
     }
 
     fn simulate_disconnect(&self, cx: &AsyncApp) {
         let (outgoing_tx, _) = mpsc::unbounded::<Envelope>();
         let (_, incoming_rx) = mpsc::unbounded::<Envelope>();
-        self.server_channel
-            .reconnect(incoming_rx, outgoing_tx, &self.server_cx.get(cx));
+        drop(
+            self.server_channel
+                .reconnect(incoming_rx, outgoing_tx, &self.server_cx.get(cx)),
+        );
     }
 
     fn start_proxy(
@@ -258,29 +389,49 @@ impl RemoteConnection for MockRemoteConnection {
         _delegate: Arc<dyn RemoteClientDelegate>,
         cx: &mut AsyncApp,
     ) -> Task<Result<i32>> {
+        if let Some(exit_code) = *self.proxy_exit_code.lock() {
+            return Task::ready(Ok(exit_code));
+        }
+        if let Some(proxy_tx) = self.proxy_tx.lock().as_ref() {
+            proxy_tx
+                .unbounded_send((client_incoming_tx, client_outgoing_rx))
+                .unwrap();
+            return cx.background_spawn(async move {
+                let _connection_activity_tx = connection_activity_tx;
+                futures::future::pending().await
+            });
+        }
+
         let (mut server_incoming_tx, server_incoming_rx) = mpsc::unbounded::<Envelope>();
         let (server_outgoing_tx, mut server_outgoing_rx) = mpsc::unbounded::<Envelope>();
 
-        self.server_channel.reconnect(
+        drop(self.server_channel.reconnect(
             server_incoming_rx,
             server_outgoing_tx,
             &self.server_cx.get(cx),
-        );
+        ));
 
+        let message_interceptors = self.message_interceptors.lock().clone();
         cx.background_spawn(async move {
             loop {
                 select_biased! {
                     server_to_client = server_outgoing_rx.next().fuse() => {
-                        let Some(server_to_client) = server_to_client else {
+                        let Some(mut server_to_client) = server_to_client else {
                             return Ok(1)
                         };
+                        if let Some(interceptors) = &message_interceptors {
+                            (interceptors.server_to_client)(&mut server_to_client);
+                        }
                         connection_activity_tx.try_send(()).ok();
                         client_incoming_tx.send(server_to_client).await.ok();
                     }
                     client_to_server = client_outgoing_rx.next().fuse() => {
-                        let Some(client_to_server) = client_to_server else {
+                        let Some(mut client_to_server) = client_to_server else {
                             return Ok(1)
                         };
+                        if let Some(interceptors) = &message_interceptors {
+                            (interceptors.client_to_server)(&mut client_to_server);
+                        }
                         server_incoming_tx.send(client_to_server).await.ok();
                     }
                 }
@@ -289,7 +440,7 @@ impl RemoteConnection for MockRemoteConnection {
     }
 
     fn path_style(&self) -> PathStyle {
-        PathStyle::local()
+        *self.path_style.lock()
     }
 
     fn remote_platform(&self) -> crate::RemotePlatform {
@@ -313,6 +464,108 @@ impl RemoteConnection for MockRemoteConnection {
 
     fn has_wsl_interop(&self) -> bool {
         false
+    }
+}
+
+pub const MOCK_STDIO_FRAME_HEX: &str = "MOCK_STDIO_FRAME_HEX";
+
+fn stdio_bootstrap_command(command: RemoteCommand) -> Result<(CommandTemplate, Vec<u8>)> {
+    let payload = command.encode()?;
+    let script = format!(
+        "{MOCK_STDIO_FRAME_HEX}=\"$(command -p dd bs=1 count={} 2>/dev/null | command -p od -An -v -tx1 | command -p tr -d ' \\n')\" || exit 1; [ \"${{#{MOCK_STDIO_FRAME_HEX}}}\" -eq {} ] || {{ printf 'mock stdio bootstrap read %s hex digits, expected {}\\n' \"${{#{MOCK_STDIO_FRAME_HEX}}}\" >&2; exit 1; }}; export {MOCK_STDIO_FRAME_HEX}; exec \"$@\"",
+        payload.len(),
+        payload.len() * 2,
+        payload.len() * 2,
+    );
+    let mut args = vec![
+        String::from("-c"),
+        script,
+        String::from("sh"),
+        command.program,
+    ];
+    args.extend(command.args);
+    Ok((
+        CommandTemplate {
+            program: String::from("/bin/sh"),
+            args,
+            env: command.env,
+        },
+        payload,
+    ))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use futures::{AsyncReadExt as _, AsyncWriteExt as _};
+    use smol::process::{Command, Stdio};
+
+    #[test]
+    fn test_stdio_bootstrap_without_target_path() -> Result<()> {
+        smol::block_on(async {
+            let (template, payload) = stdio_bootstrap_command(RemoteCommand {
+                program: String::from("/bin/sh"),
+                args: vec![
+                    String::from("-c"),
+                    format!("printf '%s\\n' \"${MOCK_STDIO_FRAME_HEX}\"; exec /bin/cat"),
+                ],
+                env: HashMap::from_iter([(String::from("PATH"), String::from("/nonexistent"))]),
+                working_dir: None,
+            })?;
+            let expected_hex = payload
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let message = b"{\"jsonrpc\":\"2.0\",\"id\":1}\n\0\xff";
+
+            let mut child = spawn(&template)?;
+            let mut stdin = child.stdin.take().unwrap();
+            stdin.write_all(&payload).await?;
+            stdin.write_all(message).await?;
+            drop(stdin);
+            let output = child.output().await?;
+            assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+            assert!(output.status.success());
+            assert_eq!(
+                output.stdout,
+                [expected_hex.as_bytes(), b"\n", message].concat()
+            );
+
+            let mut child = spawn(&template)?;
+            let mut stdin = child.stdin.take().unwrap();
+            stdin.write_all(&payload[..payload.len() / 2]).await?;
+            drop(stdin);
+            let mut stdout = Vec::new();
+            child
+                .stdout
+                .take()
+                .unwrap()
+                .read_to_end(&mut stdout)
+                .await?;
+            let output = child.output().await?;
+            assert_eq!(output.status.code(), Some(1));
+            assert_eq!(stdout, b"");
+            assert_eq!(
+                String::from_utf8_lossy(&output.stderr),
+                format!(
+                    "mock stdio bootstrap read {} hex digits, expected {}\n",
+                    payload.len() / 2 * 2,
+                    payload.len() * 2
+                )
+            );
+            Ok(())
+        })
+    }
+
+    fn spawn(template: &CommandTemplate) -> Result<smol::process::Child> {
+        Ok(Command::new(&template.program)
+            .args(&template.args)
+            .env_clear()
+            .envs(&template.env)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?)
     }
 }
 

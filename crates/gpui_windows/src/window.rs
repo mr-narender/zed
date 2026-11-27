@@ -54,6 +54,7 @@ pub struct WindowsWindowState {
     pub restore_from_minimized: Cell<Option<Box<dyn FnMut(RequestFrameOptions)>>>,
 
     pub callbacks: Callbacks,
+    pub frame_signal: Arc<PlatformFrameSignal>,
     pub input_handler: Cell<Option<PlatformInputHandler>>,
     pub ime_enabled: Cell<bool>,
     pub pending_surrogate: Cell<Option<u16>>,
@@ -89,6 +90,7 @@ pub struct WindowsWindowState {
     initial_placement: Cell<Option<WindowOpenStatus>>,
     hwnd: HWND,
     pub(crate) a11y: RefCell<Option<A11yState>>,
+    pub mouse_position: Cell<Point<Pixels>>,
 }
 
 pub(crate) struct WindowsWindowInner {
@@ -168,6 +170,7 @@ impl WindowsWindowState {
             restore_from_minimized: Cell::new(restore_from_minimized),
             min_size,
             callbacks,
+            frame_signal: Arc::new(PlatformFrameSignal::new()),
             input_handler: Cell::new(input_handler),
             ime_enabled: Cell::new(true),
             pending_surrogate: Cell::new(pending_surrogate),
@@ -189,6 +192,7 @@ impl WindowsWindowState {
             draw_coordinator,
             direct_manipulation,
             a11y: RefCell::new(None),
+            mouse_position: Cell::new(Point::default()),
         })
     }
 
@@ -256,9 +260,7 @@ impl WindowsWindowInner {
     /// has no notification for a window fully covered by other windows, so
     /// that case reports `Visible`.
     pub(crate) fn visibility(&self) -> WindowVisibility {
-        let is_visible =
-            unsafe { IsWindowVisible(self.hwnd).as_bool() && !IsIconic(self.hwnd).as_bool() };
-        if is_visible {
+        if is_window_presentable(self.hwnd) {
             WindowVisibility::Visible
         } else {
             WindowVisibility::Hidden
@@ -401,6 +403,7 @@ pub(crate) struct Callbacks {
     pub(crate) hovered_status_change: Cell<Option<Box<dyn FnMut(bool)>>>,
     pub(crate) resize: Cell<Option<Box<dyn FnMut(Size<Pixels>, f32)>>>,
     pub(crate) moved: Cell<Option<Box<dyn FnMut()>>>,
+    pub(crate) display_changed: Cell<Option<Box<dyn FnMut()>>>,
     pub(crate) should_close: Cell<Option<Box<dyn FnMut() -> bool>>>,
     pub(crate) close: Cell<Option<Box<dyn FnOnce()>>>,
     pub(crate) hit_test_window_control: Cell<Option<Box<dyn FnMut() -> Option<WindowControlArea>>>>,
@@ -998,6 +1001,10 @@ impl PlatformWindow for WindowsWindow {
         self.state.callbacks.resize.set(Some(callback));
     }
 
+    fn on_display_changed(&self, callback: Box<dyn FnMut()>) {
+        self.state.callbacks.display_changed.set(Some(callback));
+    }
+
     fn on_moved(&self, callback: Box<dyn FnMut()>) {
         self.state.callbacks.moved.set(Some(callback));
     }
@@ -1034,7 +1041,7 @@ impl PlatformWindow for WindowsWindow {
             .log_err();
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(feature = "test-support")]
     fn render_to_image(&self, scene: &Scene) -> anyhow::Result<image::RgbaImage> {
         self.state
             .renderer
@@ -1674,6 +1681,26 @@ fn set_non_rude_hwnd(hwnd: HWND, non_rude: bool) {
     } else {
         unsafe { RemovePropW(hwnd, w!("NonRudeHWND")) }.log_err();
     }
+}
+
+/// Whether the window's contents can reach the screen: it's shown, not
+/// minimized, and not cloaked by DWM, which hides windows on other virtual
+/// desktops without changing their visible state.
+pub(crate) fn is_window_presentable(hwnd: HWND) -> bool {
+    unsafe { IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool() && !is_cloaked(hwnd) }
+}
+
+fn is_cloaked(hwnd: HWND) -> bool {
+    let mut cloaked = 0u32;
+    unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED,
+            (&raw mut cloaked).cast(),
+            std::mem::size_of::<u32>() as u32,
+        )
+    }
+    .is_ok_and(|()| cloaked != 0)
 }
 
 #[cfg(test)]
