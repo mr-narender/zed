@@ -6,8 +6,9 @@ use collections::HashMap;
 pub use dap_types::{StartDebuggingRequestArguments, StartDebuggingRequestArgumentsRequest};
 use fs::Fs;
 use futures::io::BufReader;
+pub use github_releases::latest_github_release;
 use gpui::{AsyncApp, SharedString};
-pub use http_client::{HttpClient, github::latest_github_release};
+pub use http_client::HttpClient;
 use language::{LanguageName, LanguageToolchainStore};
 use node_runtime::NodeRuntime;
 use schemars::JsonSchema;
@@ -25,14 +26,6 @@ use std::{
 };
 use task::{DebugScenario, TcpArgumentsTemplate, ZedDebugConfig};
 use util::{archive::extract_zip, rel_path::RelPath};
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DapStatus {
-    None,
-    CheckingForUpdate,
-    Downloading,
-    Failed { error: String },
-}
 
 #[async_trait]
 pub trait DapDelegate: Send + Sync + 'static {
@@ -109,6 +102,15 @@ pub struct TcpArguments {
     pub host: IpAddr,
     pub port: u16,
     pub timeout: Option<u64>,
+    // Child sessions need a fresh proxy connection without restarting the adapter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stdio_proxy: Option<StdioProxy>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct StdioProxy {
+    pub command: String,
+    pub arguments: Vec<String>,
 }
 
 impl TcpArguments {
@@ -118,6 +120,7 @@ impl TcpArguments {
             host: host.host.context("missing host")?,
             port: host.port.context("missing port")?,
             timeout: host.timeout,
+            stdio_proxy: None,
         })
     }
 
@@ -264,11 +267,6 @@ pub enum DownloadedFileType {
     Vsix,
     GzipTar,
     Zip,
-}
-
-pub struct GithubRepo {
-    pub repo_name: String,
-    pub repo_owner: String,
 }
 
 pub async fn download_adapter_from_github(
@@ -457,7 +455,7 @@ impl DebugAdapter for FakeAdapter {
         task_definition: &DebugTaskDefinition,
         _: Option<PathBuf>,
         _: Option<Vec<String>>,
-        _: Option<HashMap<String, String>>,
+        env: Option<HashMap<String, String>>,
         _: &mut AsyncApp,
     ) -> Result<DebugAdapterBinary> {
         let connection = task_definition
@@ -467,13 +465,18 @@ impl DebugAdapter for FakeAdapter {
                 host: connection.host(),
                 port: connection.port.unwrap_or(17),
                 timeout: connection.timeout,
+                stdio_proxy: None,
             });
         Ok(DebugAdapterBinary {
             command: Some("command".into()),
             arguments: vec![],
             connection,
-            envs: HashMap::default(),
-            cwd: None,
+            envs: env.unwrap_or_default(),
+            cwd: task_definition
+                .config
+                .get("cwd")
+                .and_then(|cwd| cwd.as_str())
+                .map(PathBuf::from),
             request_args: StartDebuggingRequestArguments {
                 request: self.request_kind(&task_definition.config).await?,
                 configuration: task_definition.config.clone(),

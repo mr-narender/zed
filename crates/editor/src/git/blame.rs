@@ -106,8 +106,14 @@ pub struct GitBlame {
     kind: GitBlameKind,
 }
 
+pub const MAX_RELATIVE_TIMESTAMP: &str = "2 years, 11 months ago";
+
 pub trait BlameRenderer {
     fn max_author_length(&self) -> usize;
+
+    fn max_timestamp_width(&self, _: &App) -> usize {
+        MAX_RELATIVE_TIMESTAMP.len()
+    }
 
     fn blame_entry_non_text_width(&self, _: &Window, _: &App) -> Pixels {
         Pixels::ZERO
@@ -412,9 +418,13 @@ impl GitBlame {
         rows: &'a [RowInfo],
         cx: &'a mut App,
     ) -> impl Iterator<Item = Option<(BufferId, BlameEntry)>> + use<'a> {
+        let mut last_synced_buffer_id = None;
         rows.iter().map(move |info| {
             let buffer_id = info.buffer_id?;
-            self.sync(cx, buffer_id);
+            if last_synced_buffer_id != Some(buffer_id) {
+                self.sync(cx, buffer_id);
+                last_synced_buffer_id = Some(buffer_id);
+            }
 
             let buffer_row = info.buffer_row?;
             let mut cursor = self.buffers.get(&buffer_id)?.entries.cursor::<u32>(());

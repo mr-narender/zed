@@ -56,7 +56,11 @@ fn main() -> anyhow::Result<()> {
         res
     } else {
         std::io::stderr()
-            .write_all(b"usage: remote <run|proxy|version>\n")
+            .write_all(if cfg!(unix) {
+                b"usage: remote <run|proxy|version|exec|tcp>\n"
+            } else {
+                b"usage: remote <run|proxy|version|tcp>\n"
+            })
             .ok();
         std::process::exit(1);
     }

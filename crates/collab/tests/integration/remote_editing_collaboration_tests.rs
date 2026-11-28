@@ -14,7 +14,9 @@ use gpui::{
 use http_client::BlockedHttpClient;
 use language::{
     FakeLspAdapter, Language, LanguageConfig, LanguageMatcher, LanguageRegistry,
-    language_settings::{ConfiguredLanguageServer, Formatter, FormatterList, LanguageSettings},
+    language_settings::{
+        ConfiguredLanguageServer, Formatter, FormatterList, LanguageSettings, all_language_settings,
+    },
     rust_lang, tree_sitter_typescript,
 };
 use node_runtime::NodeRuntime;
@@ -33,7 +35,7 @@ use rpc::proto;
 use serde_json::json;
 use settings::{
     InlayHintSettingsContent, LanguageServerFormatterSpecifier, PrettierSettingsContent,
-    SettingsStore,
+    SemanticTokens, SettingsStore,
 };
 use std::{
     path::{Path, PathBuf},
@@ -682,12 +684,11 @@ async fn test_ssh_collaboration_formatting_with_prettier(
         )
         .await;
 
-    let test_plugin = "test_plugin";
     let ts_lang = Arc::new(Language::new(
         LanguageConfig {
             name: "TypeScript".into(),
             matcher: (LanguageMatcher {
-                path_suffixes: vec!["ts".to_string()],
+                path_suffixes: vec!["ts".into()],
                 ..LanguageMatcher::default()
             })
             .into(),
@@ -699,13 +700,8 @@ async fn test_ssh_collaboration_formatting_with_prettier(
     client_b.language_registry().add(ts_lang.clone());
 
     let languages = Arc::new(LanguageRegistry::new(server_cx.executor()));
-    let mut fake_language_servers = languages.register_fake_lsp(
-        "TypeScript",
-        FakeLspAdapter {
-            prettier_plugins: vec![test_plugin],
-            ..Default::default()
-        },
-    );
+    let mut fake_language_servers =
+        languages.register_fake_lsp("TypeScript", FakeLspAdapter::default());
 
     // User A connects to the remote project via SSH.
     server_cx.update(HeadlessProject::init);
@@ -939,7 +935,7 @@ async fn test_ssh_restarting_language_server_replaces_remote_status(
     });
 
     project_a.update(cx_a, |project, cx| {
-        project.restart_language_servers_for_buffers(vec![buffer], HashSet::default(), true, cx);
+        project.restart_language_servers_for_buffers(vec![buffer.clone()], HashSet::default(), cx);
     });
 
     let restarted_server = fake_language_servers.next().await.unwrap();
@@ -979,6 +975,53 @@ async fn test_ssh_restarting_language_server_replaces_remote_status(
             "restarting a remote language server should replace the old log store entry"
         );
     });
+
+    let lsp_store = project_a.read_with(cx_a, |project, _| project.lsp_store());
+    lsp_store.update(cx_a, |lsp_store, cx| {
+        lsp_store.stop_all_language_servers(cx);
+    });
+    executor.run_until_parked();
+    lsp_store.read_with(cx_a, |lsp_store, _| {
+        assert_eq!(lsp_store.language_server_statuses().count(), 0);
+    });
+
+    cx_a.update_global::<SettingsStore, _>(|store, cx| {
+        store.update_user_settings(cx, |settings| {
+            settings.project.all_languages.defaults.semantic_tokens = Some(SemanticTokens::Full);
+        });
+    });
+    executor.run_until_parked();
+    server_cx.read(|cx| {
+        assert_eq!(
+            all_language_settings(None, cx).defaults.semantic_tokens,
+            SemanticTokens::Full
+        );
+    });
+    lsp_store.read_with(cx_a, |lsp_store, _| {
+        assert_eq!(lsp_store.language_server_statuses().count(), 0);
+    });
+
+    project_a.update(cx_a, |project, cx| {
+        project.restart_language_servers_for_buffers(vec![buffer.clone()], HashSet::default(), cx);
+    });
+    executor.run_until_parked();
+    lsp_store.read_with(cx_a, |lsp_store, _| {
+        assert_eq!(lsp_store.language_server_statuses().count(), 1);
+    });
+    let mut resumed_server = fake_language_servers.next().await.unwrap();
+    assert_ne!(resumed_server.server.server_id(), restarted_server_id);
+    assert_eq!(
+        resumed_server
+            .receive_notification::<lsp::notification::DidOpenTextDocument>()
+            .await
+            .text_document,
+        lsp::TextDocumentItem {
+            uri: lsp::Uri::from_file_path(path!("/project/a.rs")).unwrap(),
+            language_id: "rust".to_owned(),
+            version: 0,
+            text: "fn main() {}".to_owned(),
+        }
+    );
 }
 
 #[gpui::test]
@@ -1100,6 +1143,24 @@ async fn test_slow_adapter_startup_retries(
     server_cx: &mut TestAppContext,
     executor: BackgroundExecutor,
 ) {
+    test_remote_debug_session(cx_a, server_cx, executor, false).await;
+}
+
+#[gpui::test]
+async fn test_remote_debug_session_uses_tcp_proxy(
+    cx_a: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+    executor: BackgroundExecutor,
+) {
+    test_remote_debug_session(cx_a, server_cx, executor, true).await;
+}
+
+async fn test_remote_debug_session(
+    cx_a: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+    executor: BackgroundExecutor,
+    tcp_proxy: bool,
+) {
     cx_a.update(|cx| {
         release_channel::init(semver::Version::new(0, 0, 0), cx);
         command_palette_hooks::init(cx);
@@ -1111,6 +1172,16 @@ async fn test_slow_adapter_startup_retries(
         dap_adapters::init(cx);
     });
     let (opts, server_ssh, _) = RemoteClient::fake_server(cx_a, server_cx);
+    if tcp_proxy {
+        let remote::RemoteConnectionOptions::Mock(options) = &opts else {
+            panic!("Expected a mock connection");
+        };
+        cx_a.update(|cx| {
+            remote::MockConnectionRegistry::update_global(cx, |registry, _| {
+                registry.enable_tcp_proxy(options).unwrap();
+            });
+        });
+    }
     let remote_fs = FakeFs::new(server_cx.executor());
     remote_fs
         .insert_tree(
@@ -1153,6 +1224,25 @@ async fn test_slow_adapter_startup_retries(
         .build_ssh_project(path!("/code"), client_ssh.clone(), false, cx_a)
         .await;
 
+    if tcp_proxy {
+        server_cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings
+                        .project
+                        .dap
+                        .entry("fake-adapter".into())
+                        .or_default()
+                        .env = Some(HashMap::from_iter([(
+                        "ADAPTER_TEST".into(),
+                        "wrapped".into(),
+                    )]));
+                });
+            });
+        });
+    }
+
+    let mut async_cx = cx_a.to_async();
     let (workspace, cx_a) = client_a.build_workspace(&project_a, cx_a);
 
     let debugger_panel = workspace
@@ -1184,18 +1274,19 @@ async fn test_slow_adapter_startup_retries(
             adapter: "fake-adapter".into(),
             label: "test".into(),
             config: json!({
-                "request": "launch"
+                "request": "launch",
+                "cwd": "/code/project with spaces"
             }),
             tcp_connection: Some(TcpArgumentsTemplate {
-                port: None,
+                port: tcp_proxy.then_some(4567),
                 host: None,
-                timeout: None,
+                timeout: tcp_proxy.then_some(1234),
             }),
         },
         move |client| {
             let count = count.clone();
             client.on_request_ext::<dap::requests::Initialize, _>(move |_seq, _request| {
-                if count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 5 {
+                if !tcp_proxy && count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 5 {
                     return RequestHandling::Exit;
                 }
                 RequestHandling::Respond(Ok(Capabilities::default()))
@@ -1209,6 +1300,48 @@ async fn test_slow_adapter_startup_retries(
         cx_a,
         |session: &mut project::debugger::session::Session, _| session.adapter_client().unwrap(),
     );
+    if tcp_proxy {
+        let expected = [
+            "-T",
+            "-w",
+            "/code/project with spaces",
+            "mock-remote-server",
+            "tcp",
+            "127.0.0.1:4567",
+            "1234",
+        ];
+        let binary = client.binary();
+        assert_eq!(binary.command.as_deref(), Some("mock"));
+        assert_eq!(
+            binary.arguments,
+            expected
+                .into_iter()
+                .chain(["--", "command"])
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            binary.envs.get("ADAPTER_TEST").map(String::as_str),
+            Some("wrapped")
+        );
+        assert_eq!(binary.cwd, None);
+        assert!(!client.should_reconnect_for_ssh());
+
+        let child = client
+            .create_child_connection(
+                dap::client::SessionId(u32::MAX),
+                binary.clone(),
+                Box::new(|_| {}),
+                &mut async_cx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(child.binary().command.as_deref(), Some("mock"));
+        assert_eq!(child.binary().arguments, expected);
+        assert_eq!(child.binary().envs, binary.envs);
+        assert_eq!(child.binary().cwd, None);
+        assert!(!child.should_reconnect_for_ssh());
+    }
+
     client
         .fake_event(dap::messages::Events::Stopped(dap::StoppedEvent {
             reason: dap::StoppedEventReason::Pause,
